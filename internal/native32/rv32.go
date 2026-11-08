@@ -528,11 +528,15 @@ func (e *rv32) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
 		if src, ok := e.paramReg[v.Name]; ok {
-			e.line("mv %s, %s", reg, src)
+			if reg != src {
+				e.line("mv %s, %s", reg, src)
+			}
 			return nil
 		}
 		if src, ok := e.regAlias[v.Name]; ok {
-			e.line("mv %s, %s", reg, src)
+			if reg != src {
+				e.line("mv %s, %s", reg, src)
+			}
 			return nil
 		}
 		if off, ok := e.allocas[v.Name]; ok {
@@ -574,6 +578,19 @@ func (e *rv32) loadValTo(v Value, scratch string) (string, error) {
 		return "", err
 	}
 	return scratch, nil
+}
+
+func (e *rv32) nextInst() *Inst {
+	for _, blk := range e.fn.Blocks {
+		if blk.Label != e.cur {
+			continue
+		}
+		if e.instIdx+1 < len(blk.Insts) {
+			return blk.Insts[e.instIdx+1]
+		}
+		return nil
+	}
+	return nil
 }
 
 func (e *rv32) storeDst(name string, reg string) error {
@@ -710,10 +727,25 @@ func (e *rv32) emitInst(in *Inst) error {
 				e.storeSlot(off+4, "t1")
 				return nil
 			}
-			if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+			src, err := e.loadValTo(in.Ops[0], "t0")
+			if err != nil {
 				return err
 			}
-			e.storeSized(e.allocas[v.Name], sz, "t0")
+			e.storeSized(e.allocas[v.Name], sz, src)
+			return nil
+		}
+		sz := in.Ty.Size()
+		if sz == 1 || sz == 2 || sz == 4 {
+			val, err := e.loadValTo(in.Ops[0], "t0")
+			if err != nil {
+				return err
+			}
+			ptr, err := e.loadValTo(in.Ops[1], "t1")
+			if err != nil {
+				return err
+			}
+			op := map[int]string{1: "sb", 2: "sh", 4: "sw"}[sz]
+			e.line("%s %s, 0(%s)", op, val, ptr)
 			return nil
 		}
 		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
@@ -722,14 +754,7 @@ func (e *rv32) emitInst(in *Inst) error {
 		if err := e.loadVal(in.Ops[1], "t1"); err != nil {
 			return err
 		}
-		sz := in.Ty.Size()
 		switch sz {
-		case 1:
-			e.line("sb t0, 0(t1)")
-		case 2:
-			e.line("sh t0, 0(t1)")
-		case 4:
-			e.line("sw t0, 0(t1)")
 		case 8:
 			e.loadSlot(e.slots[in.Ops[0].Name]+4, "t2")
 			e.line("sw t0, 0(t1)")
@@ -1307,6 +1332,16 @@ func (e *rv32) emitCall(in *Inst) error {
 		e.line("call %s", name)
 	}
 	if in.Dst != "" && in.Ty != nil && in.Ty.Kind != KVoid {
+		// A result consumed by the very next instruction can stay in a0 (or
+		// a0/a1) instead of taking the store+load round trip.  A following
+		// call is excluded: its other argument setup may overwrite a0 before
+		// this value is moved to its argument register.
+		if in.Ty.Size() <= 4 && !e.cross[in.Dst] && e.lastUse[in.Dst] == e.instIdx+1 {
+			if n := e.nextInst(); n != nil && n.Op != "call" {
+				e.regAlias[in.Dst] = "a0"
+				return nil
+			}
+		}
 		if in.Ty.Size() > 4 {
 			off := e.slots[in.Dst]
 			e.storeSlot(off, "a0")

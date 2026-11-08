@@ -99,8 +99,8 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 159,372 | 87,630 | 1.82x |
-| LZ4TOS total | 107,236 | 66,850 | 1.60x |
+| raw ELF total | 158,668 | 87,630 | 1.81x |
+| LZ4TOS total | 107,055 | 66,850 | 1.60x |
 
 Examples (raw ELF / LZ4TOS):
 
@@ -109,8 +109,8 @@ Examples (raw ELF / LZ4TOS):
 | `hello` | 1,656 / 1,223 | 998 / 724 |
 | `hello_printf` | 3,156 / 2,132 | 1,606 / 1,202 |
 | `reloc` | 2,200 / 1,554 | 1,142 / 856 |
-| `wheap` | 4,072 / 2,801 | 1,974 / 1,550 |
-| `sh` | 26,788 / 16,160 | 16,054 / 12,589 |
+| `wheap` | 4,072 / 2,802 | 1,974 / 1,550 |
+| `sh` | 26,436 / 16,086 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -130,6 +130,9 @@ after the peephole were:
 - a parameter whose only use is the initial store to a direct local is written
   straight from its incoming argument register in the prologue, and the store
   instruction disappears;
+- a call result consumed by the next instruction stays in `a0` instead of
+  taking the stack round trip, and memory stores use an already-live value or
+  pointer register directly;
 - dead pure SSA computations are removed before code generation;
 - the RV32 peephole forwards loads, deletes dead stores, sinks small constants
   into ALU instructions, turns multiply/divide by a power of two into shifts,

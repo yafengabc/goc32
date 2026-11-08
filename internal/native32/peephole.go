@@ -507,6 +507,9 @@ func rv32DropJumps(lines []string) []string {
 func rv32FoldCopies(lines []string) []string {
 	out := make([]string, 0, len(lines))
 	for i := 0; i < len(lines); i++ {
+		if d, s, ok := rv32Move(lines[i]); ok && d == s {
+			continue
+		}
 		if i+1 < len(lines) {
 			if d, s, ok := rv32Move(lines[i+1]); ok && rv32TmpReg(s) {
 				if nd, ok := rv32Retarget(lines[i], s, d); ok && !rv32ReadBeforeWrite(lines[i+2:], s) {
