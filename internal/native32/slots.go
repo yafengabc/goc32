@@ -1,5 +1,7 @@
 package native32
 
+import "sort"
+
 // Frame slot planning.  Every SSA value needs a slot, but most are short-lived
 // temporaries inside one basic block.  Giving each a unique slot made frames
 // huge (and on Thumb, large offsets cost an address calculation per access).
@@ -61,11 +63,13 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 	defBlock := map[string]int{}
 	cross := map[string]bool{}
 	useBlocks := map[string]map[int]bool{}
+	uses := map[string]int{}
 	phiUses := map[string]bool{}
 	addUse := func(v Value, bi int) {
 		if v.Kind != VLocal {
 			return
 		}
+		uses[v.Name]++
 		if useBlocks[v.Name] == nil {
 			useBlocks[v.Name] = map[int]bool{}
 		}
@@ -165,6 +169,85 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 	}
 	uniqueMode := est-cur <= 2048
 
+	// Mark the values that need dedicated slots.  In unique mode that is every
+	// value; otherwise only values crossing blocks, used by a phi, or wider
+	// than a word.
+	permanent := map[string]bool{}
+	for _, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" {
+				continue
+			}
+			ty := dstTy(in)
+			if uniqueMode || ty.Size() > 4 || ty.Align() > 4 || cross[in.Dst] || phiUses[in.Dst] || in.Op == "phi" {
+				permanent[in.Dst] = true
+			}
+		}
+	}
+
+	// Simulate the per-block pool first, before placing anything else.  The
+	// pool is the hot set, so it goes at the bottom of the frame where Thumb
+	// and RVC have a short load/store offset.  Permanent slots move above it.
+	poolIdx := map[string]int{}
+	maxNext := 0
+	if !uniqueMode {
+		for _, blk := range f.Blocks {
+			lastUse := blockLastUses(blk)
+			free := []int{}
+			next := 0
+			pool := map[string]int{}
+			freeName := func(name string) {
+				if idx, ok := pool[name]; ok {
+					free = append(free, idx)
+					delete(pool, name)
+				}
+			}
+			for i, in := range blk.Insts {
+				if in.Dst != "" && !permanent[in.Dst] && in.Op != "alloca" && skipSet[in.Dst] == "" {
+					ty := dstTy(in)
+					if ty.Size() <= 4 && ty.Align() <= 4 {
+						var idx int
+						if len(free) > 0 {
+							idx = free[len(free)-1]
+							free = free[:len(free)-1]
+						} else {
+							idx = next
+							next++
+						}
+						pool[in.Dst] = idx
+						poolIdx[in.Dst] = idx
+						L.slotTy[in.Dst] = ty
+					}
+				}
+				for _, op := range in.Ops {
+					if op.Kind == VLocal && lastUse[op.Name] == i {
+						freeName(op.Name)
+					}
+				}
+				for _, c := range in.Cases {
+					if c.Val.Kind == VLocal && lastUse[c.Val.Name] == i {
+						freeName(c.Val.Name)
+					}
+				}
+				if in.Indirect && in.Callee != "" && lastUse[in.Callee] == i {
+					freeName(in.Callee)
+				}
+				if in.Dst != "" && lastUse[in.Dst] == i {
+					freeName(in.Dst)
+				}
+			}
+			if next > maxNext {
+				maxNext = next
+			}
+		}
+	}
+	poolBase := base + reserve
+	if uniqueMode {
+		cur = poolBase
+	} else {
+		cur = poolBase + maxNext*4
+	}
+
 	// Alloca objects.  The pointer slot is only needed when the pointer is
 	// copied by a phi; otherwise the back end rematerialises sp+offset.
 	for _, blk := range f.Blocks {
@@ -199,24 +282,23 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 		L.slotTy[p.Name] = p.Ty
 		cur += sz
 	}
-	permanent := map[string]bool{}
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
 			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" {
 				continue
 			}
-			ty := dstTy(in)
-			if uniqueMode || ty.Size() > 4 || ty.Align() > 4 || cross[in.Dst] || phiUses[in.Dst] || in.Op == "phi" {
-				sz := ty.Size()
-				if sz < 4 {
-					sz = 4
-				}
-				cur = align(cur, max(4, min(8, ty.Align())))
-				L.slots[in.Dst] = cur
-				L.slotTy[in.Dst] = ty
-				cur += sz
-				permanent[in.Dst] = true
+			if !permanent[in.Dst] {
+				continue
 			}
+			ty := dstTy(in)
+			sz := ty.Size()
+			if sz < 4 {
+				sz = 4
+			}
+			cur = align(cur, max(4, min(8, ty.Align())))
+			L.slots[in.Dst] = cur
+			L.slotTy[in.Dst] = ty
+			cur += sz
 		}
 	}
 	for _, blk := range f.Blocks {
@@ -234,81 +316,31 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 		}
 	}
 
-	// Pool for block-local words.  Slots are indices into a pool based at
-	// poolBase; the pool is reset for each block because a block-local value
-	// is dead by the end of its block.
-	if uniqueMode {
-		L.end = cur
-		return L
+	// Assign the pool slots at the bottom of the frame, below all permanent
+	// objects.  Hot block-local values get the lowest indices: the pool can
+	// reuse an index over time, so rank each index by the total number of
+	// accesses to the values that live there.
+	freq := map[int]int{}
+	for name, idx := range poolIdx {
+		freq[idx] += uses[name] + 1
 	}
-	poolBase := cur
-	pool := map[string]int{} // value -> pool index
-	maxNext := 0
-	for _, blk := range f.Blocks {
-		lastUse := map[string]int{}
-		for i, in := range blk.Insts {
-			for _, op := range in.Ops {
-				if op.Kind == VLocal {
-					lastUse[op.Name] = i
-				}
-			}
-			for _, c := range in.Cases {
-				if c.Val.Kind == VLocal {
-					lastUse[c.Val.Name] = i
-				}
-			}
-			if in.Indirect && in.Callee != "" {
-				lastUse[in.Callee] = i
-			}
-		}
-		free := []int{}
-		next := 0
-		pool = map[string]int{}
-		freeName := func(name string) {
-			if idx, ok := pool[name]; ok {
-				free = append(free, idx)
-				delete(pool, name)
-			}
-		}
-		for i, in := range blk.Insts {
-			if in.Dst != "" && !permanent[in.Dst] && in.Op != "alloca" && skipSet[in.Dst] == "" {
-				ty := dstTy(in)
-				if ty.Size() <= 4 && ty.Align() <= 4 {
-					var idx int
-					if len(free) > 0 {
-						idx = free[len(free)-1]
-						free = free[:len(free)-1]
-					} else {
-						idx = next
-						next++
-					}
-					pool[in.Dst] = idx
-					L.slots[in.Dst] = poolBase + idx*4
-					L.slotTy[in.Dst] = ty
-				}
-			}
-			for _, op := range in.Ops {
-				if op.Kind == VLocal && lastUse[op.Name] == i {
-					freeName(op.Name)
-				}
-			}
-			for _, c := range in.Cases {
-				if c.Val.Kind == VLocal && lastUse[c.Val.Name] == i {
-					freeName(c.Val.Name)
-				}
-			}
-			if in.Indirect && in.Callee != "" && lastUse[in.Callee] == i {
-				freeName(in.Callee)
-			}
-			if in.Dst != "" && lastUse[in.Dst] == i {
-				freeName(in.Dst)
-			}
-		}
-		if next > maxNext {
-			maxNext = next
-		}
+	order := make([]int, maxNext)
+	for i := range order {
+		order[i] = i
 	}
-	cur = poolBase + maxNext*4
+	sort.Slice(order, func(a, b int) bool {
+		if freq[order[a]] != freq[order[b]] {
+			return freq[order[a]] > freq[order[b]]
+		}
+		return order[a] < order[b]
+	})
+	rank := make([]int, maxNext)
+	for r, idx := range order {
+		rank[idx] = r
+	}
+	for name, idx := range poolIdx {
+		L.slots[name] = poolBase + rank[idx]*4
+	}
 	L.end = cur
 	return L
 }
