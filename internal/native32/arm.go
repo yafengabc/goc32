@@ -12,24 +12,29 @@ import (
 )
 
 type arm struct {
-	m    *Module
-	b    strings.Builder
-	fn   *Func
-	frame int
+	m        *Module
+	b        strings.Builder
+	fn       *Func
+	frame    int
 	outBytes int
-	slots map[string]int
-	slotTy map[string]*Type
-	allocas map[string]int
-	phiTmp map[string]int
-	saveOff int
+	slots    map[string]int
+	slotTy   map[string]*Type
+	allocas  map[string]int
+	phiTmp   map[string]int
+	saveOff  int
 	epilogue string
-	nFixed int
-	cur  string
-	seq  int
+	nFixed   int
+	cur      string
+	seq      int
+	v6m      bool
 }
 
 func EmitARM(m *Module, cpu string) (string, error) {
 	e := &arm{m: m}
+	// ARMv6-M has no MOVW/MOVT and only a 1 KiB PC-relative literal-load
+	// range, so a huge basic block can put the next pool out of reach. Take
+	// the inline-literal path there; ARMv7-M/ARMv8-M keep the compact pools.
+	e.v6m = strings.HasPrefix(cpu, "cortex-m0") || strings.HasPrefix(cpu, "cortex-m1")
 	e.b.WriteString("\t.syntax unified\n\t.thumb\n\t.text\n")
 	for _, g := range m.Globals {
 		e.emitGlobal(g)
@@ -44,7 +49,28 @@ func EmitARM(m *Module, cpu string) (string, error) {
 }
 
 func (e *arm) symAddr(reg, name string) {
-	e.line("ldr %s, =%s", reg, name)
+	e.litLoad(reg, name)
+}
+
+// litLoad materialises a link-time constant (a symbol address or a large
+// integer). On ARMv7-M/ARMv8-M `ldr rX, =expr` uses the pool at the end of the
+// basic block. On ARMv6-M that pool can be more than ldr's 1 KiB reach away
+// inside a large block, so the literal is emitted right here and skipped with
+// a short branch. The .word also carries the same ABS32 relocation, which the
+// kernel patches because TinyOS links these images with -z notext.
+func (e *arm) litLoad(reg, expr string) {
+	if !e.v6m {
+		e.line("ldr %s, =%s", reg, expr)
+		return
+	}
+	n := e.seq
+	e.seq++
+	e.line("ldr %s, .Llit%d", reg, n)
+	e.line("b .Llitend%d", n)
+	e.line(".balign 4")
+	e.label(fmt.Sprintf(".Llit%d", n))
+	e.line(".word %s", expr)
+	e.label(fmt.Sprintf(".Llitend%d", n))
 }
 
 func (e *arm) line(f string, a ...interface{}) { fmt.Fprintf(&e.b, "\t"+f+"\n", a...) }
@@ -59,13 +85,18 @@ func (e *arm) emitGlobal(g *Global) {
 	}
 	size := g.Ty.Size()
 	zero := g.Init.Kind == VZero
-	switch {
-	case zero:
-		e.b.WriteString("\t.bss\n")
-	case g.Const:
-		e.b.WriteString("\t.section .rodata\n")
-	default:
-		e.b.WriteString("\t.data\n")
+	sec := ".data." + sanitize(g.Name)
+	if g.Name == "G_tos_stack_note" || g.Name == "G_tos_heap_note" {
+		sec = ".note.tos"
+		e.b.WriteString("\t.section " + sec + ",\"a\",%note\n")
+	} else if zero {
+		sec = ".bss." + sanitize(g.Name)
+		e.b.WriteString("\t.section " + sec + ",\"aw\",%nobits\n")
+	} else if g.Const {
+		sec = ".rodata." + sanitize(g.Name)
+		e.b.WriteString("\t.section " + sec + ",\"a\",%progbits\n")
+	} else {
+		e.b.WriteString("\t.section " + sec + ",\"aw\",%progbits\n")
 	}
 	local := g.Private ||
 		strings.HasPrefix(g.Name, ".const.") ||
@@ -119,6 +150,14 @@ func (e *arm) emitInit(t *Type, v Value) {
 		e.b.WriteString(fmt.Sprintf("\t.byte %d\n", byte(v.U&1)))
 	case VGlobal:
 		e.b.WriteString(fmt.Sprintf("\t.word %s\n", v.Name))
+	case VGlobalOff:
+		if v.I == 0 {
+			e.b.WriteString(fmt.Sprintf("\t.word %s\n", v.Name))
+		} else if v.I > 0 {
+			e.b.WriteString(fmt.Sprintf("\t.word %s+%d\n", v.Name, v.I))
+		} else {
+			e.b.WriteString(fmt.Sprintf("\t.word %s-%d\n", v.Name, -v.I))
+		}
 	case VAgg:
 		switch t.Kind {
 		case KArray:
@@ -242,7 +281,7 @@ func (e *arm) emitFunc(f *Func) error {
 		e.frame = 8
 	}
 
-	e.b.WriteString("\t.text\n")
+	e.b.WriteString("\t.section .text." + sanitize(f.Name) + ",\"ax\",%progbits\n")
 	if !strings.HasPrefix(f.Name, ".") {
 		e.b.WriteString("\t.globl " + f.Name + "\n")
 	}
@@ -301,7 +340,11 @@ func (e *arm) emitFunc(f *Func) error {
 }
 
 func (e *arm) storeSlotReg(off int, reg string) {
-	if off%4 == 0 && off/4 <= 255 {
+	// 5-bit scaled immediate: the largest [sp, #imm] Thumb-1 can encode is
+	// #124. Restricting to that keeps one binary valid on both ARMv6-M
+	// (RP2040) and ARMv7-M/ARMv8-M, and the address-forming path below
+	// takes over for anything larger.
+	if off%4 == 0 && off >= 0 && off <= 124 {
 		e.line("str %s, [sp, #%d]", reg, off)
 		return
 	}
@@ -311,12 +354,32 @@ func (e *arm) storeSlotReg(off int, reg string) {
 }
 
 func (e *arm) loadSlot(off int, reg string) {
-	if off%4 == 0 && off/4 <= 255 {
+	if off%4 == 0 && off >= 0 && off <= 124 {
 		e.line("ldr %s, [sp, #%d]", reg, off)
 		return
 	}
-	e.addrOf(off, reg)
-	e.line("ldr %s, [%s]", reg, reg)
+	// Form the address in the callee-saved scratch r4, never in the
+	// destination: a large local can be loaded into r12 (indirect call
+	// target) or r3 (high word of a 64-bit pair), and Thumb-1's adds
+	// immediate cannot address r8-r15 anyway.
+	e.addrOf(off, "r4")
+	if highReg(reg) {
+		// Thumb-1 ldr only takes low registers for Rt, so land in r4
+		// (already our scratch) and move across. r0-r3 may be holding
+		// call arguments at this point.
+		e.line("ldr r4, [r4]")
+		e.line("mov %s, r4", reg)
+		return
+	}
+	e.line("ldr %s, [r4]", reg)
+}
+
+func highReg(reg string) bool {
+	switch reg {
+	case "r8", "r9", "r10", "r11", "r12":
+		return true
+	}
+	return false
 }
 
 func (e *arm) addrOf(off int, reg string) {
@@ -383,7 +446,7 @@ func (e *arm) li(reg string, v uint64) {
 		e.line("movs %s, #%d", reg, v)
 		return
 	}
-	e.line("ldr %s, =%d", reg, v)
+	e.litLoad(reg, fmt.Sprintf("%d", v))
 }
 
 func (e *arm) storeDst(name, reg string) error {

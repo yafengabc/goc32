@@ -810,11 +810,90 @@ func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string
 		}
 	}
 	// A bare identifier naming an array decays to the address of its first
-	// element, the same way it does in an expression.
-	if id, ok := e.(*frontend.Ident); ok && m.symKind[id.Name] == "global" {
-		return "@G_" + id.Name, true
+	// element, the same way it does in an expression. A bare function name
+	// does the same: { double_it, negate_it } is an array of function
+	// pointers. Missing the function case left such a table `external`, and
+	// reloc.c's G_ops then had no definition at link time.
+	if id, ok := e.(*frontend.Ident); ok {
+		switch m.symKind[id.Name] {
+		case "global":
+			return "@G_" + id.Name, true
+		case "func":
+			return "@" + irFuncSym(id.Name), true
+		}
+	}
+	// A constant integer expression such as TOS_HEAP(12 * 1024): the note
+	// macros cast an arithmetic expression, and without folding it here the
+	// global stayed external, so the kernel never saw the stack/heap hint.
+	if v, ok := constIntValue(e); ok {
+		return m.constScalar(&frontend.NumLit{Val: v, Kind: frontend.TInt}, t)
 	}
 	return "", false
+}
+
+// constIntValue folds the constant integer expressions that appear in global
+// initialisers (notably the TOS_STACK/TOS_HEAP note macros).
+func constIntValue(e frontend.Expr) (int64, bool) {
+	switch n := e.(type) {
+	case *frontend.NumLit:
+		return n.Val, true
+	case *frontend.CastExpr:
+		return constIntValue(n.E)
+	case *frontend.Unary:
+		v, ok := constIntValue(n.E)
+		if !ok {
+			return 0, false
+		}
+		switch n.Op {
+		case "+":
+			return v, true
+		case "-":
+			return -v, true
+		case "~":
+			return ^v, true
+		case "!":
+			if v == 0 {
+				return 1, true
+			}
+			return 0, true
+		}
+	case *frontend.Binary:
+		a, ok := constIntValue(n.L)
+		if !ok {
+			return 0, false
+		}
+		b, ok := constIntValue(n.R)
+		if !ok {
+			return 0, false
+		}
+		switch n.Op {
+		case "+":
+			return a + b, true
+		case "-":
+			return a - b, true
+		case "*":
+			return a * b, true
+		case "/":
+			if b != 0 {
+				return a / b, true
+			}
+		case "%":
+			if b != 0 {
+				return a % b, true
+			}
+		case "<<":
+			return a << (uint(b) & 63), true
+		case ">>":
+			return a >> (uint(b) & 63), true
+		case "&":
+			return a & b, true
+		case "|":
+			return a | b, true
+		case "^":
+			return a ^ b, true
+		}
+	}
+	return 0, false
 }
 
 // constInitAddrName reports the object an "&name" in a static initialiser

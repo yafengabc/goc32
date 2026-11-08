@@ -53,7 +53,8 @@ Targets:
 | `rp2350` | Thumb / ARMv8-M | `thumbv8m.main`, Cortex-M33 | `armelf` |
 
 Diagnostics: `-S` (assembly), `-ir` (gocl IR), `-E` (preprocessed C), `-keep`,
-`-v`. Extra includes/defines: `-I`, `-D`.
+`-v`, `-pack` (wrap an already linked ELF in LZ4TOS without compiling). Extra
+includes/defines: `-I`, `-D`.
 
 The compiler finds the TinyOS checkout by walking up from the input source (it
 looks for `user/lib.c`, `user/user.ld`, `include/tos.h`). Use `-tos DIR` or
@@ -81,8 +82,38 @@ and rebuilding the ramdisk installs it without recompression.
 
 Tested end to end:
 
-- RV32 / ESP32-C3, `hello` and `hello_printf`, in `rv32emu-c`;
-- ARM / QEMU mps2 Cortex-M3, `hello` and `hello_printf`, in `qemu-system-arm`.
+- RV32 / ESP32-C3, `hello`, `hello_printf`, `reloc`, `wheap`, `ls` and `sh`
+  in `rv32emu-c`;
+- ARM / QEMU mps2 Cortex-M3, the same set in `qemu-system-arm`.
+
+All 37 programs under `user/` compile and link for RV32. 36/37 do so for ARM;
+`smp.c` is the exception because it binds GCC register variables to `r0`/`r1`/
+`r2` and issues a raw `svc #0`.
+
+## Code size
+
+The back end is a stack machine: every SSA value gets a frame slot and no
+optimisation runs, so images are larger than clang's. Measured over all 37
+`user/*.c` programs (RV32IMC, `-O2` clang baseline from `build/fs-stage/bin`):
+
+| | goc32 | clang | ratio |
+|---|---:|---:|---:|
+| raw ELF total | 432,508 | 100,004 | 4.32x |
+| LZ4TOS total | 263,632 | 74,183 | 3.55x |
+
+Examples (raw ELF / LZ4TOS):
+
+| program | goc32 | clang |
+|---|---:|---:|
+| `hello` | 3,480 / 2,425 | 1,292 / 896 |
+| `hello_printf` | 8,692 / 5,797 | 1,944 / 1,405 |
+| `reloc` | 4,440 / 3,036 | 1,436 / 1,027 |
+| `wheap` | 10,824 / 7,081 | 2,364 / 1,780 |
+| `sh` | 83,908 / 41,670 | 16,392 / 12,790 |
+
+Thumb output is roughly another 1.7-2x larger than RV32 because Thumb-1 cannot
+encode most immediates or long branches directly; those become literal-pool
+words and branch islands.
 
 ## Layout
 

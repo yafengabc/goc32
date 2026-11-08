@@ -11,3 +11,11 @@ __tos_syscall:
     ecall
     ret
     .size __tos_syscall, .-__tos_syscall
+
+/* GCC inline asm's TOS_ILLEGAL_INSN() in TinyOS's lib.h. */
+    .globl __goc32_trap
+    .type __goc32_trap,@function
+__goc32_trap:
+    .word 0
+    ret
+    .size __goc32_trap, .-__goc32_trap

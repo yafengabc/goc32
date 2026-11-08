@@ -26,9 +26,9 @@ import (
 
 	"goc/common"
 	"goc/frontend"
+	"goc32/internal/lz4tos"
 	"gocl"
 	"native32"
-	"goc32/internal/lz4tos"
 )
 
 //go:embed tinyos/goc/usys.h tinyos/goc/syscall_rv32.S tinyos/goc/syscall_arm.S
@@ -48,19 +48,19 @@ type target struct {
 var targets = map[string]target{
 	"rv32": {
 		Name: "rv32", Arch: "rv32", IRArch: "riscv32",
-		Triple: "riscv32-unknown-elf",
+		Triple:    "riscv32-unknown-elf",
 		ArchFlags: []string{"-march=rv32imc", "-mabi=ilp32"},
 		Emulation: "elf32lriscv",
 	},
 	"esp32c3": {
 		Name: "esp32c3", Arch: "rv32", IRArch: "riscv32",
-		Triple: "riscv32-unknown-elf",
+		Triple:    "riscv32-unknown-elf",
 		ArchFlags: []string{"-march=rv32imc", "-mabi=ilp32"},
 		Emulation: "elf32lriscv",
 	},
 	"rv32nc": {
 		Name: "rv32nc", Arch: "rv32", IRArch: "riscv32",
-		Triple: "riscv32-unknown-elf",
+		Triple:    "riscv32-unknown-elf",
 		ArchFlags: []string{"-march=rv32im", "-mabi=ilp32"},
 		Emulation: "elf32lriscv",
 	},
@@ -85,19 +85,20 @@ var targets = map[string]target{
 }
 
 type options struct {
-	target  string
-	tos     string
-	out     string
-	incs    []string
-	defs    []string
-	asmOnly bool
-	irOnly  bool
-	preOnly bool
-	keep    bool
-	verbose bool
-	cc      string
-	ld      string
-	inputs  []string
+	target   string
+	tos      string
+	out      string
+	incs     []string
+	defs     []string
+	asmOnly  bool
+	irOnly   bool
+	preOnly  bool
+	packOnly bool
+	keep     bool
+	verbose  bool
+	cc       string
+	ld       string
+	inputs   []string
 }
 
 func main() {
@@ -129,6 +130,8 @@ func main() {
 			o.irOnly = true
 		case "-E":
 			o.preOnly = true
+		case "-pack":
+			o.packOnly = true
 		case "-keep":
 			o.keep = true
 		case "-v":
@@ -163,6 +166,7 @@ func usage() {
   -S             emit assembly only
   -ir            emit the gocl IR only
   -E             preprocess only
+  -pack          wrap an already linked ELF in LZ4TOS (no compile)
   -keep          keep the temporary build directory
   -cc PATH       clang path (default: clang)
   -ld PATH       ld.lld path (default: ld.lld)
@@ -183,6 +187,19 @@ func run(o options) error {
 	t, ok := targets[o.target]
 	if !ok {
 		return fmt.Errorf("unknown target %q", o.target)
+	}
+	if o.packOnly {
+		if len(o.inputs) != 1 {
+			return fmt.Errorf("-pack takes exactly one ELF")
+		}
+		out := outputPath(o.out, o.inputs[0], ".tos")
+		res, err := lz4tos.Pack(o.inputs[0], out)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: %d -> %d bytes (LZ4TOS, hint %d/%d/%d)\n",
+			out, res.RawSize, res.CompSize, res.Hint.Span, res.Hint.StackAsk, res.Hint.HeapAsk)
+		return nil
 	}
 	tos, err := findTOS(o.tos, o.inputs[0])
 	if err != nil {
@@ -325,10 +342,19 @@ func compileOne(src, out string, t target, incs, defs []string, o options) error
 	if err != nil {
 		return err
 	}
-	text := common.InjectDefines(string(raw), defs)
+	// GCC basic/extended asm is not parsed by the front end. The TinyOS
+	// userland uses exactly two shapes: an empty compiler barrier and the
+	// illegal-instruction macro. Both are rewritten to a runtime trap helper
+	// (or dropped, for the empty barrier) before parsing.
+	srcText := "void __goc32_trap(void);\n" + string(raw)
+	text := common.InjectDefines(srcText, defs)
 	toks, err := common.PreprocessTarget(text, src, false, incs...)
 	if err != nil {
 		return fmt.Errorf("%s: preprocess: %w", src, err)
+	}
+	toks, err = rewriteAsm(toks)
+	if err != nil {
+		return fmt.Errorf("%s: %w", src, err)
 	}
 	if o.preOnly {
 		return writeFile(out, []byte(common.SerializeTokens(toks)))
@@ -561,4 +587,101 @@ func writeFile(p string, b []byte) error {
 		fmt.Printf("assembly written to %s\n", p)
 	}
 	return nil
+}
+
+// rewriteAsm replaces GCC __asm__/asm constructs with a call to the runtime
+// trap helper, or removes an empty barrier. It works on the preprocessed token
+// stream so macros such as TOS_ILLEGAL_INSN() are already expanded.
+func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
+	var out []frontend.Token
+	for i := 0; i < len(toks); i++ {
+		tk := toks[i]
+		if !isAsmToken(tk) {
+			out = append(out, tk)
+			continue
+		}
+		j := i + 1
+		volatileSeen := false
+		for j < len(toks) && (toks[j].Text == "volatile" || toks[j].Text == "__volatile__") {
+			volatileSeen = true
+			j++
+		}
+		if j >= len(toks) || toks[j].Text != "(" {
+			out = append(out, tk)
+			continue
+		}
+		open := j
+		depth := 0
+		close := -1
+		var asmText []byte
+		seenStr := false
+		for k := open; k < len(toks); k++ {
+			switch toks[k].Text {
+			case "(":
+				depth++
+			case ")":
+				depth--
+				if depth == 0 {
+					close = k
+				}
+			}
+			if depth == 1 && !seenStr && toks[k].Kind == frontend.TStr {
+				asmText = toks[k].Str
+				seenStr = true
+			}
+			if close >= 0 {
+				break
+			}
+		}
+		if close < 0 {
+			return nil, fmt.Errorf("unterminated inline asm")
+		}
+		// register int r0 __asm__("r0") = ... — a register-binding
+		// declarator, not an asm statement. The back end treats register as a
+		// no-op, so drop the binding and let normal allocation happen.
+		if !volatileSeen && len(out) > 0 && out[len(out)-1].Kind == frontend.TIdent {
+			after := ""
+			if close+1 < len(toks) {
+				after = toks[close+1].Text
+			}
+			switch after {
+			case "=", ",", ";", "[":
+				i = close
+				continue
+			}
+		}
+		body := strings.TrimSpace(string(asmText))
+		if body == "" {
+			// An empty asm is a compiler barrier; the stack-machine back ends
+			// do not optimise, so dropping it is equivalent.
+			i = close
+			continue
+		}
+		if !isTrapAsm(body) {
+			return nil, fmt.Errorf("unsupported inline asm %q", body)
+		}
+		line := tk.Line
+		out = append(out,
+			frontend.Token{Kind: frontend.TIdent, Text: "__goc32_trap", Line: line},
+			frontend.Token{Kind: frontend.TPunct, Text: "(", Line: line},
+			frontend.Token{Kind: frontend.TPunct, Text: ")", Line: line},
+		)
+		i = close
+	}
+	return out, nil
+}
+
+func isAsmToken(t frontend.Token) bool {
+	if t.Kind != frontend.TIdent && t.Kind != frontend.TKeyword {
+		return false
+	}
+	return t.Text == "__asm__" || t.Text == "__asm" || t.Text == "asm"
+}
+
+func isTrapAsm(s string) bool {
+	return strings.Contains(s, "udf") ||
+		strings.Contains(s, "ud2") ||
+		strings.Contains(s, ".word 0") ||
+		strings.Contains(s, "unimp") ||
+		strings.Contains(s, "ebreak")
 }

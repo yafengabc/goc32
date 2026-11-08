@@ -1427,6 +1427,15 @@ func assignable(dst, src *Type) bool {
 	if dst == nil || src == nil {
 		return true // an error was already reported upstream
 	}
+	// A function argument or initialiser of array type decays to a pointer to
+	// its first element (C11 6.3.2.1p3). The checker kept the array type on
+	// expressions like fds[i] in pipe(fds[i]), so compare the decayed form.
+	if src.IsArray() && src.Elem != nil {
+		src = PtrType(src.Elem)
+	}
+	if dst.IsArray() && dst.Elem != nil {
+		dst = PtrType(dst.Elem)
+	}
 	if dst.IsVoid() || src.IsVoid() {
 		return false
 	}

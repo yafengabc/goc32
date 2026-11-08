@@ -149,8 +149,14 @@ func alignOf(t *Type) int {
 		return 4
 	case KLongDouble:
 		return 16
-	case KDouble, KPtr, KFunc:
+	case KDouble:
 		return 8
+	case KPtr, KFunc:
+		// goc32 only targets 32-bit machines (RV32, ARM/Thumb), so a
+		// pointer is four bytes. Keeping the 8 from the x86-64 host made
+		// every `array[i]` on a pointer scale by 8 in the IR, and reloc's
+		// pointer table read every other entry.
+		return 4
 	case KArr:
 		return alignOf(t.Elem)
 	case KStruct, KUnion:
@@ -177,8 +183,10 @@ func sizeOf(t *Type) int {
 		return 4
 	case KLongDouble:
 		return 16
-	case KDouble, KPtr, KFunc:
+	case KDouble:
 		return 8
+	case KPtr, KFunc:
+		return 4
 	case KArr:
 		return sizeOf(t.Elem) * t.Len
 	case KStruct, KUnion:

@@ -10,3 +10,13 @@ __tos_syscall:
     svc     #0
     bx      lr
     .size __tos_syscall, .-__tos_syscall
+
+/* GCC inline asm's TOS_ILLEGAL_INSN() in TinyOS's lib.h.  0xDE00 is the
+ * 16-bit Thumb encoding of UDF #0, available on ARMv6-M and ARMv8-M. */
+    .globl __goc32_trap
+    .thumb_func
+    .type __goc32_trap,%function
+__goc32_trap:
+    .hword  0xDE00
+    bx      lr
+    .size __goc32_trap, .-__goc32_trap

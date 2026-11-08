@@ -147,6 +147,7 @@ type ValKind int
 const (
 	VLocal ValKind = iota
 	VGlobal
+	VGlobalOff // @global + constant byte offset (a GEP in an initializer)
 	VInt
 	VNull
 	VUndef
@@ -172,6 +173,8 @@ func (v Value) String() string {
 		return "%" + v.Name
 	case VGlobal:
 		return "@" + v.Name
+	case VGlobalOff:
+		return fmt.Sprintf("@%s%+d", v.Name, v.I)
 	case VInt:
 		return strconv.FormatInt(v.I, 10)
 	case VNull:
@@ -226,18 +229,18 @@ type Case struct {
 }
 
 type Inst struct {
-	Op     string
-	Dst    string
-	Ty     *Type // result / loaded / allocated / destination type
-	SrcTy  *Type // cast source
-	Ops    []Value
-	OpTys  []*Type
-	Pred   string
-	Labels []string
-	Cases  []Case
-	Callee string
+	Op       string
+	Dst      string
+	Ty       *Type // result / loaded / allocated / destination type
+	SrcTy    *Type // cast source
+	Ops      []Value
+	OpTys    []*Type
+	Pred     string
+	Labels   []string
+	Cases    []Case
+	Callee   string
 	Indirect bool
-	Align  int
+	Align    int
 }
 
 type Module struct {
@@ -391,6 +394,9 @@ func parseValueAt(s string, i int) (Value, int, error) {
 	i = skipSpace(s, i)
 	if i >= len(s) {
 		return Value{}, i, fmt.Errorf("expected value at end of %q", s)
+	}
+	if strings.HasPrefix(s[i:], "getelementptr ") || strings.HasPrefix(s[i:], "getelementptr\t") {
+		return parseGEPAt(s, i)
 	}
 	switch s[i] {
 	case '%':
@@ -596,7 +602,101 @@ func splitTop(s string) []string {
 	return out
 }
 
-// ---- module parser -----------------------------------------------------
+// parseGEPAt parses a constant getelementptr used as a global initializer and
+// reduces it to symbol+offset. LLVM prints such a pointer as e.g.
+//
+//	getelementptr inbounds ([6 x i8], ptr @.const.0, i64 0, i64 0)
+//
+// which is just the address of the string; reloc.c has an array of these.
+func parseGEPAt(s string, i int) (Value, int, error) {
+	j := i + len("getelementptr")
+	j = skipSpace(s, j)
+	if strings.HasPrefix(s[j:], "inbounds") {
+		j += len("inbounds")
+		j = skipSpace(s, j)
+	}
+	// Constant-expression form: getelementptr inbounds (T, ptr @x, ...).
+	if j < len(s) && s[j] == '(' {
+		j++
+	}
+	cur, j, err := parseTypeAt(s, j)
+	if err != nil {
+		return Value{}, i, err
+	}
+	j = skipSpace(s, j)
+	if j < len(s) && s[j] == ',' {
+		j++
+	}
+	j = skipSpace(s, j)
+	if strings.HasPrefix(s[j:], "ptr") {
+		j += 3
+	} else {
+		if _, j, err = parseTypeAt(s, j); err != nil {
+			return Value{}, i, err
+		}
+	}
+	base, j, err := parseValueAt(s, j)
+	if err != nil {
+		return Value{}, i, err
+	}
+	if base.Kind != VGlobal {
+		return Value{}, i, fmt.Errorf("GEP base is not a global: %s", base)
+	}
+	var off int64
+	first := true
+	for {
+		j = skipSpace(s, j)
+		if j >= len(s) || s[j] != ',' {
+			break
+		}
+		// A GEP index is <integer type> <value>. The comma that separates
+		// array elements is followed by the element type (usually "ptr");
+		// leave that comma for the aggregate initializer parser.
+		comma := j
+		ty, nj, err := parseTypeAt(s, j+1)
+		if err != nil || ty.Kind != KInt {
+			j = comma
+			break
+		}
+		j = nj
+		idx, nj, err := parseValueAt(s, j)
+		if err != nil {
+			return Value{}, i, err
+		}
+		j = nj
+		if idx.Kind != VInt {
+			return Value{}, i, fmt.Errorf("non-constant GEP index %s", idx)
+		}
+		n := idx.I
+		if first {
+			off += n * int64(cur.Size())
+			first = false
+			continue
+		}
+		switch cur.Kind {
+		case KArray:
+			cur = cur.Elem
+			off += n * int64(cur.Size())
+		case KStruct:
+			if n < 0 || int(n) >= len(cur.Fields) {
+				return Value{}, i, fmt.Errorf("GEP field %d out of range", n)
+			}
+			fo := 0
+			for k := 0; k < int(n); k++ {
+				fo = align(fo, cur.Fields[k].Align()) + cur.Fields[k].Size()
+			}
+			off += int64(fo)
+			cur = cur.Fields[n]
+		default:
+			off += n
+		}
+	}
+	j = skipSpace(s, j)
+	if j < len(s) && s[j] == ')' {
+		j++
+	}
+	return Value{Kind: VGlobalOff, Name: base.Name, I: off}, j, nil
+}
 
 func ParseModule(src string) (*Module, error) {
 	m := &Module{}
