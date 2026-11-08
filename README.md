@@ -135,11 +135,11 @@ after the peephole were:
 - small functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
 
-Thumb output is still larger because Thumb-1 cannot encode most immediates or
-long branches directly; those become literal-pool words and branch islands.
-The ARM emitter uses the 12-bit `[sp,#off]` form on ARMv7-M/ARMv8-M, one
-`add r4, sp, #imm` for ARMv6-M up to 1 KiB, and an inline literal for larger
-offsets.  ARM `sh` is 77 KiB on the Cortex-M3 target and 90 KiB for the
+The same register-variable and parameter-store fusion runs on Thumb, using
+`r5-r7` (ARMv6-M ALU instructions only encode low registers) and writing
+parameters straight from `r0-r3`.  The emitter also uses the 12-bit
+`[sp,#off]` form on ARMv7-M/v8-M and an inline literal for very large frame
+offsets.  ARM `sh` is 75 KiB on the Cortex-M3 target and 86 KiB for the
 RP2040, down from 199 KiB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB

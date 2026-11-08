@@ -25,6 +25,13 @@ type arm struct {
 	regVar   map[string]string
 	sRegs    []string
 	sRegOff  map[string]int
+	regAlias map[string]string
+	aliasVar map[string]string
+	cross    map[string]bool
+	lastUse  map[string]int
+	instIdx  int
+	paramTgt map[string]string
+	skipInst map[*Inst]bool
 	phiTmp   map[string]int
 	saveOff  int
 	epilogue string
@@ -232,12 +239,16 @@ func (e *arm) emitFunc(f *Func) error {
 	// prologue can store it before it is used.
 	r4Off := cur
 	e.direct = findDirectAllocas(f)
-	e.regVar, e.sRegs = map[string]string{}, nil
+	e.regVar, e.sRegs = planRegVars(f, []string{"r5", "r6", "r7"}, 3)
+	e.regAlias = map[string]string{}
+	e.aliasVar = map[string]string{}
 	L := layoutSlots(f, e.outBytes, 4)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
 	e.slotTy = L.slotTy
+	e.cross = L.cross
+	e.paramTgt, e.skipInst = findParamStores(f, e.direct, e.regVar)
 	cur = L.end
 	e.sRegOff = map[string]int{}
 	for _, r := range e.sRegs {
@@ -286,6 +297,22 @@ func (e *arm) emitFunc(f *Func) error {
 		}
 		off := e.slots[p.Name]
 		for k := 0; k < w; k++ {
+			if target := e.paramTgt[p.Name]; target != "" && w == 1 {
+				src := ""
+				if ri < 4 {
+					src = fmt.Sprintf("r%d", ri)
+				} else {
+					e.loadSlot(e.frame+(ri-4)*4, "r0")
+					src = "r0"
+				}
+				if reg := e.regVar[target]; reg != "" {
+					e.line("mov %s, %s", reg, src)
+				} else {
+					e.storeSlotReg(e.allocas[target], src)
+				}
+				ri++
+				continue
+			}
 			if ri < 4 {
 				e.storeSlotReg(off+k*4, fmt.Sprintf("r%d", ri))
 			} else {
@@ -305,7 +332,11 @@ func (e *arm) emitFunc(f *Func) error {
 	for _, blk := range f.Blocks {
 		e.label(blockLabel(f, blk.Label))
 		e.cur = blk.Label
-		for _, in := range blk.Insts {
+		e.regAlias = map[string]string{}
+		e.aliasVar = map[string]string{}
+		e.lastUse = blockLastUses(blk)
+		for i, in := range blk.Insts {
+			e.instIdx = i
 			if err := e.emitInst(in); err != nil {
 				return err
 			}
@@ -502,6 +533,10 @@ func (e *arm) adjustSP(n int) {
 func (e *arm) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if src, ok := e.regAlias[v.Name]; ok {
+			e.line("mov %s, %s", reg, src)
+			return nil
+		}
 		if off, ok := e.allocas[v.Name]; ok {
 			e.addrOf(off, reg)
 			return nil
@@ -531,6 +566,18 @@ func (e *arm) li(reg string, v uint64) {
 		return
 	}
 	e.litLoad(reg, fmt.Sprintf("%d", v))
+}
+
+func (e *arm) loadValTo(v Value, scratch string) (string, error) {
+	if v.Kind == VLocal {
+		if src, ok := e.regAlias[v.Name]; ok {
+			return src, nil
+		}
+	}
+	if err := e.loadVal(v, scratch); err != nil {
+		return "", err
+	}
+	return scratch, nil
 }
 
 func (e *arm) storeDst(name, reg string) error {
@@ -574,6 +621,11 @@ func (e *arm) emitInst(in *Inst) error {
 		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
 			off := e.allocas[v.Name]
 			if reg := e.regVar[v.Name]; reg != "" {
+				if !e.cross[in.Dst] {
+					e.regAlias[in.Dst] = reg
+					e.aliasVar[in.Dst] = v.Name
+					return nil
+				}
 				e.line("mov r1, %s", reg)
 			} else if in.Ty.Size() == 8 {
 				e.loadSlot(off, "r1")
@@ -615,8 +667,34 @@ func (e *arm) emitInst(in *Inst) error {
 		}
 		return e.storeDst(in.Dst, "r1")
 	case "store":
+		if e.skipInst[in] {
+			return nil
+		}
 		if v := in.Ops[1]; v.Kind == VLocal && e.direct[v.Name] {
 			sz := in.Ty.Size()
+			if reg := e.regVar[v.Name]; reg != "" {
+				for name, av := range e.aliasVar {
+					if av != v.Name {
+						continue
+					}
+					if e.lastUse[name] > e.instIdx {
+						e.line("mov r1, %s", reg)
+						if err := e.storeDst(name, "r1"); err != nil {
+							return err
+						}
+					}
+					delete(e.regAlias, name)
+					delete(e.aliasVar, name)
+				}
+				src, err := e.loadValTo(in.Ops[0], "r0")
+				if err != nil {
+					return err
+				}
+				if src != reg {
+					e.line("mov %s, %s", reg, src)
+				}
+				return nil
+			}
 			if sz == 8 {
 				if err := e.loadPair(in.Ops[0], "r0", "r1"); err != nil {
 					return err
@@ -629,11 +707,7 @@ func (e *arm) emitInst(in *Inst) error {
 			if err := e.loadVal(in.Ops[0], "r0"); err != nil {
 				return err
 			}
-			if reg := e.regVar[v.Name]; reg != "" {
-				e.line("mov %s, r0", reg)
-			} else {
-				e.storeSized(e.allocas[v.Name], sz, "r0")
-			}
+			e.storeSized(e.allocas[v.Name], sz, "r0")
 			return nil
 		}
 		if err := e.loadVal(in.Ops[0], "r0"); err != nil {
@@ -756,43 +830,66 @@ func (e *arm) emitBin(in *Inst) error {
 	if wide {
 		return e.emitBin64(in)
 	}
-	if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+	rA, err := e.loadValTo(in.Ops[0], "r0")
+	if err != nil {
 		return err
 	}
-	if err := e.loadVal(in.Ops[1], "r1"); err != nil {
+	rB, err := e.loadValTo(in.Ops[1], "r1")
+	if err != nil {
 		return err
+	}
+	toR0 := func() {
+		if rA != "r0" {
+			e.line("movs r0, %s", rA)
+		}
 	}
 	switch in.Op {
 	case "add":
-		e.line("adds r0, r0, r1")
+		e.line("adds r0, %s, %s", rA, rB)
 	case "sub":
-		e.line("subs r0, r0, r1")
+		e.line("subs r0, %s, %s", rA, rB)
 	case "mul":
-		e.line("movs r2, r0")
-		e.line("muls r2, r1")
-		e.line("movs r0, r2")
-	case "sdiv":
-		e.line("bl __aeabi_idiv")
-	case "udiv":
-		e.line("bl __aeabi_uidiv")
-	case "srem":
-		e.line("bl __aeabi_idivmod")
-		e.line("movs r0, r1")
-	case "urem":
-		e.line("bl __aeabi_uidivmod")
-		e.line("movs r0, r1")
+		toR0()
+		e.line("muls r0, %s", rB)
+	case "sdiv", "udiv", "srem", "urem":
+		if rA != "r0" {
+			e.line("mov r0, %s", rA)
+		}
+		if rB != "r1" {
+			e.line("mov r1, %s", rB)
+		}
+		switch in.Op {
+		case "sdiv":
+			e.line("bl __aeabi_idiv")
+		case "udiv":
+			e.line("bl __aeabi_uidiv")
+		case "srem":
+			e.line("bl __aeabi_idivmod")
+			e.line("movs r0, r1")
+		case "urem":
+			e.line("bl __aeabi_uidivmod")
+			e.line("movs r0, r1")
+		}
 	case "shl":
-		e.line("lsls r0, r1")
+		toR0()
+		e.line("lsls r0, %s", rB)
 	case "lshr":
-		e.line("lsrs r0, r1")
+		toR0()
+		e.line("lsrs r0, %s", rB)
 	case "ashr":
-		e.line("asrs r0, r1")
+		toR0()
+		e.line("asrs r0, %s", rB)
 	case "and":
-		e.line("ands r0, r1")
+		toR0()
+		e.line("ands r0, %s", rB)
 	case "or":
-		e.line("orrs r0, r1")
+		toR0()
+		e.line("orrs r0, %s", rB)
 	case "xor":
-		e.line("eors r0, r1")
+		toR0()
+		e.line("eors r0, %s", rB)
+	default:
+		return fmt.Errorf("unsupported binop %s", in.Op)
 	}
 	return e.storeDst(in.Dst, "r0")
 }
@@ -886,10 +983,12 @@ func (e *arm) emitICmp(in *Inst) error {
 	if in.Ty.Size() > 4 {
 		return e.emitICmp64(in)
 	}
-	if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+	rA, err := e.loadValTo(in.Ops[0], "r0")
+	if err != nil {
 		return err
 	}
-	if err := e.loadVal(in.Ops[1], "r1"); err != nil {
+	rB, err := e.loadValTo(in.Ops[1], "r1")
+	if err != nil {
 		return err
 	}
 	// cmp sets flags; branch before the first movs, which would clobber them.
@@ -919,7 +1018,7 @@ func (e *arm) emitICmp(in *Inst) error {
 		return fmt.Errorf("unsupported icmp predicate %s", in.Pred)
 	}
 	t, done := e.newLabel(), e.newLabel()
-	e.line("cmp r0, r1")
+	e.line("cmp %s, %s", rA, rB)
 	e.condBranch(cond, t)
 	e.line("movs r0, #0")
 	e.jump(done)
@@ -1102,11 +1201,12 @@ func (e *arm) emitBr(in *Inst) error {
 		e.jump(blockLabel(e.fn, in.Labels[0]))
 		return nil
 	}
-	if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+	cond, err := e.loadValTo(in.Ops[0], "r0")
+	if err != nil {
 		return err
 	}
 	tr := e.newLabel()
-	e.line("cmp r0, #0")
+	e.line("cmp %s, #0", cond)
 	e.condBranch("ne", tr)
 	if err := e.emitPhiCopies(in.Labels[1], e.cur); err != nil {
 		return err
@@ -1121,12 +1221,13 @@ func (e *arm) emitBr(in *Inst) error {
 }
 
 func (e *arm) emitSwitch(in *Inst) error {
-	if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+	cond, err := e.loadValTo(in.Ops[0], "r0")
+	if err != nil {
 		return err
 	}
 	for _, c := range in.Cases {
 		e.li("r1", uint64(c.Val.I))
-		e.line("cmp r0, r1")
+		e.line("cmp %s, r1", cond)
 		e.condBranch("eq", blockLabel(e.fn, c.Dest))
 	}
 	if err := e.emitPhiCopies(in.Labels[0], e.cur); err != nil {
