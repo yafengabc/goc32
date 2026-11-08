@@ -427,12 +427,11 @@ func (e *rv32) adjustSP(n int) {
 		e.line("addi sp, sp, %d", n)
 		return
 	}
+	// li carries the sign, so a single add is enough. Subtracting the
+	// immediate as well (as this did) turned a negative frame into an
+	// upward move and every >2 KiB frame wrote above the task window.
 	e.line("li t0, %d", n)
-	if n < 0 {
-		e.line("sub sp, sp, t0")
-	} else {
-		e.line("add sp, sp, t0")
-	}
+	e.line("add sp, sp, t0")
 }
 
 func (e *rv32) addImm(reg string, imm int) {

@@ -98,22 +98,29 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 432,508 | 100,004 | 4.32x |
-| LZ4TOS total | 263,632 | 74,183 | 3.55x |
+| raw ELF total | 432,508 | 87,630 | 4.94x |
+| LZ4TOS total | 263,615 | 66,850 | 3.94x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 3,480 / 2,425 | 1,292 / 896 |
-| `hello_printf` | 8,692 / 5,797 | 1,944 / 1,405 |
-| `reloc` | 4,440 / 3,036 | 1,436 / 1,027 |
-| `wheap` | 10,824 / 7,081 | 2,364 / 1,780 |
-| `sh` | 83,908 / 41,670 | 16,392 / 12,790 |
+| `hello` | 3,480 / 2,425 | 998 / 724 |
+| `hello_printf` | 8,692 / 5,797 | 1,606 / 1,202 |
+| `reloc` | 4,440 / 3,036 | 1,142 / 856 |
+| `wheap` | 10,824 / 7,081 | 1,974 / 1,550 |
+| `sh` | 83,908 / 41,654 | 16,054 / 12,589 |
 
 Thumb output is roughly another 1.7-2x larger than RV32 because Thumb-1 cannot
 encode most immediates or long branches directly; those become literal-pool
 words and branch islands.
+
+The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
+default stack and relies on the kernel doubling it once; goc32's unoptimised
+frame for `recurse` is 4,400 bytes instead of roughly 2 KiB, which pushes the
+image into the next 16 KiB window grain and leaves no heap tail to grow into.
+`deep 1` runs, `deep` (six levels) still faults. Shrinking frames needs slot
+reuse or a register allocator.
 
 ## Layout
 
