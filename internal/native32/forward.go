@@ -1,12 +1,13 @@
 package native32
 
-// Local load forwarding for scalar allocas whose address never escapes.
+// Load forwarding for scalar allocas whose address never escapes.
 //
 // findDirectAllocas proves that such an object is only ever the pointer operand
 // of a load or a store, so every write to it is visible in the IR and a call
-// cannot change it.  Inside one basic block a store followed by a load (or two
-// loads with no store in between) therefore reads exactly the SSA value the
-// previous access left there, and the load can be replaced by that value.
+// cannot change it.  A load can therefore be replaced by the SSA value the
+// previous access left in that cell: inside one block this is a plain forward
+// scan, and across blocks a must-analysis propagates a value only when every
+// predecessor agrees on the exact same SSA name.
 //
 // This is the value-level half of mem2reg: the address half already removes
 // the pointer arithmetic, and this removes the redundant loads the front end
@@ -19,6 +20,51 @@ func forwardDirectLoads(m *Module, regVars, minCount int) {
 	for _, f := range m.Funcs {
 		forwardLoadsFunc(f, regVars, minCount)
 	}
+}
+
+// storeTarget reports the tracked alloca written by a store and the SSA value
+// that store leaves there.  Constants are not tracked: the consumer's operand
+// type is not recorded, and an i64 constant would lose its high word.
+func storeTarget(in *Inst, size map[string]int) (string, Value, bool) {
+	if in.Op != "store" || in.Ty == nil || len(in.Ops) < 2 {
+		return "", Value{}, false
+	}
+	p, v := in.Ops[1], in.Ops[0]
+	if p.Kind != VLocal || size[p.Name] == 0 || in.Ty.Size() != size[p.Name] || v.Kind != VLocal {
+		return "", Value{}, false
+	}
+	return p.Name, v, true
+}
+
+func sameAvail(a, b map[string]Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		w, ok := b[k]
+		if !ok || w.Kind != v.Kind || w.Name != v.Name {
+			return false
+		}
+	}
+	return true
+}
+
+func blockSuccessors(b *Block) []string {
+	if len(b.Insts) == 0 {
+		return nil
+	}
+	last := b.Insts[len(b.Insts)-1]
+	switch last.Op {
+	case "br":
+		return last.Labels
+	case "switch":
+		out := append([]string{}, last.Labels...)
+		for _, c := range last.Cases {
+			out = append(out, c.Dest)
+		}
+		return out
+	}
+	return nil
 }
 
 func forwardLoadsFunc(f *Func, regVars, minCount int) {
@@ -45,10 +91,67 @@ func forwardLoadsFunc(f *Func, regVars, minCount int) {
 		return
 	}
 
+	// Must-analysis over the CFG: in[b][a] is the value every predecessor
+	// agrees the cell a holds on entry to b.  Blocks with no predecessors
+	// start empty, and a loop back edge with no value keeps the header empty,
+	// which only loses an optimisation, never correctness.
+	preds := map[string][]*Block{}
+	for _, blk := range f.Blocks {
+		for _, s := range blockSuccessors(blk) {
+			preds[s] = append(preds[s], blk)
+		}
+	}
+	inAvail := map[string]map[string]Value{}
+	outAvail := map[string]map[string]Value{}
+	for pass := 0; pass <= len(f.Blocks); pass++ {
+		changed := false
+		for _, blk := range f.Blocks {
+			cur := map[string]Value{}
+			if ps := preds[blk.Label]; len(ps) > 0 {
+				for name, v := range outAvail[ps[0].Label] {
+					agrees := true
+					for _, p := range ps[1:] {
+						w, ok := outAvail[p.Label][name]
+						if !ok || w.Kind != v.Kind || w.Name != v.Name {
+							agrees = false
+							break
+						}
+					}
+					if agrees {
+						cur[name] = v
+					}
+				}
+			}
+			if !sameAvail(cur, inAvail[blk.Label]) {
+				inAvail[blk.Label] = cur
+				changed = true
+			}
+			next := make(map[string]Value, len(cur))
+			for k, v := range cur {
+				next[k] = v
+			}
+			for _, in := range blk.Insts {
+				if name, v, ok := storeTarget(in, size); ok {
+					next[name] = v
+				}
+			}
+			if !sameAvail(next, outAvail[blk.Label]) {
+				outAvail[blk.Label] = next
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
 	subst := map[string]Value{} // load result -> value known to be in memory
 	drop := map[*Inst]bool{}
 	for _, blk := range f.Blocks {
-		avail := map[string]Value{} // alloca -> value its cell holds now
+		avail := map[string]Value{}
+		for k, v := range inAvail[blk.Label] {
+			avail[k] = v
+		}
 		for _, in := range blk.Insts {
 			switch in.Op {
 			case "load":
@@ -66,16 +169,9 @@ func forwardLoadsFunc(f *Func, regVars, minCount int) {
 				}
 				avail[p.Name] = Value{Kind: VLocal, Name: in.Dst}
 			case "store":
-				if in.Ty == nil || len(in.Ops) < 2 {
-					continue
+				if name, v, ok := storeTarget(in, size); ok {
+					avail[name] = v
 				}
-				p, v := in.Ops[1], in.Ops[0]
-				// Only SSA values are substituted: a constant has no single
-				// IR name and the consumer's operand type is not recorded.
-				if p.Kind != VLocal || size[p.Name] == 0 || in.Ty.Size() != size[p.Name] || v.Kind != VLocal {
-					continue
-				}
-				avail[p.Name] = v
 			}
 		}
 	}
@@ -111,4 +207,8 @@ func forwardLoadsFunc(f *Func, regVars, minCount int) {
 		}
 		blk.Insts = kept
 	}
+	// The dropped loads may have been the only users of a chain of pure
+	// instructions, so clean up immediately rather than waiting for a pass
+	// that runs before this one.
+	dceFunc(f)
 }

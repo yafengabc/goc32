@@ -6,8 +6,9 @@ package native32
 // with no uses also removes the uses of its operands, so this iterates.
 //
 // Loads and calls are kept even when their result is unused: a load can fault
-// and a call has side effects.  Stores and terminators have no result and are
-// never candidates.
+// and a call has side effects.  The exception is a load from a non-escaping
+// alloca, which reads our own stack frame.  Stores and terminators have no
+// result and are never candidates.
 
 func dceModule(m *Module) {
 	for _, f := range m.Funcs {
@@ -16,6 +17,7 @@ func dceModule(m *Module) {
 }
 
 func dceFunc(f *Func) {
+	direct := findDirectAllocas(f)
 	for {
 		uses := map[string]int{}
 		for _, blk := range f.Blocks {
@@ -40,7 +42,7 @@ func dceFunc(f *Func) {
 		for _, blk := range f.Blocks {
 			kept := blk.Insts[:0]
 			for _, in := range blk.Insts {
-				if in.Dst != "" && uses[in.Dst] == 0 && pureInst(in.Op) {
+				if in.Dst != "" && uses[in.Dst] == 0 && removable(in, direct) {
 					changed = true
 					continue
 				}
@@ -52,6 +54,19 @@ func dceFunc(f *Func) {
 			return
 		}
 	}
+}
+
+// removable reports instructions whose result is not observable.  A load is
+// normally kept even when unused because it may fault, but a load from a
+// non-escaping alloca reads our own stack frame and cannot.
+func removable(in *Inst, direct map[string]bool) bool {
+	if pureInst(in.Op) {
+		return true
+	}
+	if in.Op == "load" && len(in.Ops) > 0 && in.Ops[0].Kind == VLocal {
+		return direct[in.Ops[0].Name]
+	}
+	return false
 }
 
 func pureInst(op string) bool {
