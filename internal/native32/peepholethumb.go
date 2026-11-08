@@ -29,6 +29,15 @@ func armPeephole(src string, wide bool) string {
 
 var armWordSp = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
 
+var armSizeSp = regexp.MustCompile(`^((?:ldrb|ldrh|ldrsb|ldrsh)) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
+
+func armStripComment(s string) string {
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
 var armRegRe = regexp.MustCompile(`^r(?:[0-9]|1[0-2])$`)
 
 // armNoDest lists the instructions whose first operand is not a destination.
@@ -56,10 +65,16 @@ func armWrites(body string) string {
 // Thumb has no equivalent of the RV32 slot cache, and the stack-machine
 // emitter stores many SSA results that are read again a few instructions
 // later.  Calls, labels and directives end the block and clear the cache.
+//
+// Once a function has been processed, word stores to slots that no surviving
+// load reads are deleted.  Stores marked with @ goc32keep (outgoing stack
+// arguments and the vararg register save area) are never removed.
 func armSlotForward(src string) string {
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
 	slotReg := map[int]string{}
+	used := map[int]bool{}
+	funcStart := 0
 	clear := func() {
 		slotReg = map[int]string{}
 	}
@@ -69,6 +84,13 @@ func armSlotForward(src string) string {
 				delete(slotReg, off)
 			}
 		}
+	}
+	spOff := func(m []string) int {
+		if m[3] == "" {
+			return 0
+		}
+		off, _ := strconv.Atoi(m[3])
+		return off
 	}
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "\t") {
@@ -81,6 +103,32 @@ func armSlotForward(src string) string {
 			out = append(out, line)
 			continue
 		}
+		if strings.HasPrefix(body, ".section .text.") {
+			used = map[int]bool{}
+			funcStart = len(out)
+			clear()
+			out = append(out, line)
+			continue
+		}
+		if strings.HasPrefix(body, ".size ") {
+			kept := out[:funcStart]
+			for _, l := range out[funcStart:] {
+				b := armStripComment(strings.TrimSpace(l))
+				if m := armWordSp.FindStringSubmatch(b); m != nil && m[1] == "str" {
+					off := spOff(m)
+					if !used[off] && !strings.Contains(l, "goc32keep") {
+						continue
+					}
+				}
+				kept = append(kept, l)
+			}
+			out = kept
+			used = map[int]bool{}
+			funcStart = len(out)
+			clear()
+			out = append(out, line)
+			continue
+		}
 		if strings.HasPrefix(body, ".") {
 			if body == ".ltorg" {
 				clear()
@@ -89,10 +137,7 @@ func armSlotForward(src string) string {
 			continue
 		}
 		if m := armWordSp.FindStringSubmatch(body); m != nil {
-			off := 0
-			if m[3] != "" {
-				off, _ = strconv.Atoi(m[3])
-			}
+			off := spOff(m)
 			reg := m[2]
 			if m[1] == "str" {
 				slotReg[off] = reg
@@ -112,8 +157,13 @@ func armSlotForward(src string) string {
 			// value for another slot; the loaded value is now its slot's.
 			kill(reg)
 			slotReg[off] = reg
+			used[off] = true
 			out = append(out, line)
 			continue
+		}
+		// Byte/halfword loads are not forwarded but still read their slot.
+		if m := armSizeSp.FindStringSubmatch(body); m != nil {
+			used[spOff(m)] = true
 		}
 		f := strings.Fields(body)
 		if f[0] == "bl" || f[0] == "blx" || f[0] == "bx" || f[0] == "b" || f[0] == "pop" || armInvert[f[0]] != "" {

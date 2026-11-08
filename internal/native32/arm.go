@@ -305,7 +305,7 @@ func (e *arm) emitFunc(f *Func) error {
 	}
 	if f.Variadic {
 		for i := 0; i < 4; i++ {
-			e.storeSlotReg(e.saveOff+i*4, fmt.Sprintf("r%d", i))
+			e.storeSlotRegKeep(e.saveOff+i*4, fmt.Sprintf("r%d", i))
 		}
 	}
 	ri := 0
@@ -379,6 +379,16 @@ func (e *arm) emitFunc(f *Func) error {
 }
 
 func (e *arm) storeSlotReg(off int, reg string) {
+	e.storeSlotOp(off, reg, false)
+}
+
+// storeSlotRegKeep writes a slot that is read by the callee or through a
+// pointer rather than by a local ldr.  The slot pass must not delete it.
+func (e *arm) storeSlotRegKeep(off int, reg string) {
+	e.storeSlotOp(off, reg, true)
+}
+
+func (e *arm) storeSlotOp(off int, reg string, keep bool) {
 	// ARMv6-M can encode only a 5-bit scaled offset (#124); ARMv7-M and
 	// ARMv8-M also have the 12-bit form (#4095), which keeps big frames
 	// from paying for an address calculation on every access.
@@ -386,13 +396,17 @@ func (e *arm) storeSlotReg(off int, reg string) {
 	if e.wide {
 		limit = 4095
 	}
+	suffix := ""
+	if keep {
+		suffix = " @ goc32keep"
+	}
 	if off >= 0 && off <= limit && off%4 == 0 {
-		e.line("str %s, [sp, #%d]", reg, off)
+		e.line("str %s, [sp, #%d]%s", reg, off, suffix)
 		return
 	}
 	addr := "r4"
 	e.addrOf(off, addr)
-	e.line("str %s, [%s]", reg, addr)
+	e.line("str %s, [%s]%s", reg, addr, suffix)
 }
 
 func (e *arm) loadSlot(off int, reg string) {
@@ -1509,13 +1523,13 @@ func (e *arm) emitCall(in *Inst) error {
 			if err := e.loadPair(v, "r0", "r1"); err != nil {
 				return err
 			}
-			e.storeSlotReg(p.word*4, "r0")
-			e.storeSlotReg(p.word*4+4, "r1")
+			e.storeSlotRegKeep(p.word*4, "r0")
+			e.storeSlotRegKeep(p.word*4+4, "r1")
 		} else {
 			if err := e.loadVal(v, "r0"); err != nil {
 				return err
 			}
-			e.storeSlotReg(p.word*4, "r0")
+			e.storeSlotRegKeep(p.word*4, "r0")
 		}
 	}
 	for i, v := range in.Ops {

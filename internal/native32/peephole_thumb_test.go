@@ -36,3 +36,29 @@ func TestArmSlotForward(t *testing.T) {
 		t.Fatalf("armSlotForward:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestArmDeadStoreDelete(t *testing.T) {
+	in := []string{
+		"\t.section .text.f,\"ax\",%progbits",
+		"f:",
+		"\tstr r0, [sp, #4]",
+		"\tstr r1, [sp, #8]",
+		"\tstr r2, [sp, #12] @ goc32keep",
+		"\tldr r3, [sp, #8]",
+		"\tret",
+		"\t.size f, .-f",
+	}
+	want := []string{
+		"\t.section .text.f,\"ax\",%progbits",
+		"f:",
+		// slot 4 is written and never read; slot 8's only read is forwarded
+		// to r1, so its store is dead too.
+		"\tstr r2, [sp, #12] @ goc32keep",
+		"\tmov r3, r1",
+		"\tret",
+		"\t.size f, .-f",
+	}
+	if got := strings.Split(armSlotForward(strings.Join(in, "\n")), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("armSlotForward dead stores:\n got %q\nwant %q", got, want)
+	}
+}
