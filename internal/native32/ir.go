@@ -774,6 +774,7 @@ func ParseModule(src string) (*Module, error) {
 	if fn != nil {
 		return nil, fmt.Errorf("unterminated function %s", fn.Name)
 	}
+	simplifyModule(m)
 	dceModule(m)
 	return m, nil
 }
