@@ -42,7 +42,7 @@ func EmitRV32(m *Module) (string, error) {
 		}
 	}
 	e.b.WriteString("\t.section .note.GNU-stack,\"\",@progbits\n")
-	return e.b.String(), nil
+	return peepholeRV32(e.b.String()), nil
 }
 
 func (e *rv32) line(f string, a ...interface{}) {
@@ -235,6 +235,22 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.outBytes = align(maxStack*4, 8)
 
 	// Pass 2: assign a slot to every SSA value and an object to every alloca.
+	// An alloca's pointer is rematerialised as `sp+offset` at each use, so it
+	// needs a pointer slot only when a phi copies the pointer (phi moves read
+	// the slot directly).
+	phiVals := map[string]bool{}
+	for _, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			if in.Op != "phi" {
+				continue
+			}
+			for _, op := range in.Ops {
+				if op.Kind == VLocal {
+					phiVals[op.Name] = true
+				}
+			}
+		}
+	}
 	cur := e.outBytes
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
@@ -256,6 +272,9 @@ func (e *rv32) emitFunc(f *Func) error {
 				cur += in.Ty.Size()
 				if cur < 4 {
 					cur = 4
+				}
+				if !phiVals[in.Dst] {
+					continue
 				}
 			}
 			cur = align(cur, 4)
@@ -314,7 +333,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.storeSlot(raOff, "ra")
 	if f.Variadic {
 		for i := 0; i < 8; i++ {
-			e.storeSlot(e.saveOff+i*4, fmt.Sprintf("a%d", i))
+			e.storeSlotKeep(e.saveOff+i*4, fmt.Sprintf("a%d", i))
 		}
 	}
 	// Spill parameters.
@@ -413,6 +432,23 @@ func (e *rv32) storeSlot(off int, reg string) {
 	e.line("sw %s, 0(%s)", reg, scratch)
 }
 
+// storeSlotKeep is storeSlot for values another function reads (outgoing stack
+// arguments and the vararg register save area).  The peephole must not treat
+// the absence of a local load as proof that the store is dead.
+func (e *rv32) storeSlotKeep(off int, reg string) {
+	if off >= -2048 && off <= 2047 {
+		e.line("sw %s, %d(sp) # goc32keep", reg, off)
+		return
+	}
+	scratch := "t5"
+	if reg == "t5" {
+		scratch = "t6"
+	}
+	e.line("li %s, %d", scratch, off)
+	e.line("add %s, sp, %s", scratch, scratch)
+	e.line("sw %s, 0(%s) # goc32keep", reg, scratch)
+}
+
 func (e *rv32) addrSp(off int, reg string) {
 	if off >= -2048 && off <= 2047 {
 		e.line("addi %s, sp, %d", reg, off)
@@ -446,6 +482,10 @@ func (e *rv32) addImm(reg string, imm int) {
 func (e *rv32) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if off, ok := e.allocas[v.Name]; ok {
+			e.addrSp(off, reg)
+			return nil
+		}
 		off, ok := e.slots[v.Name]
 		if !ok {
 			return fmt.Errorf("unknown local %%%s", v.Name)
@@ -498,6 +538,10 @@ func (e *rv32) loadPair(v Value, lo, hi string) error {
 func (e *rv32) emitInst(in *Inst) error {
 	switch in.Op {
 	case "alloca":
+		if _, ok := e.slots[in.Dst]; !ok {
+			// Rematerialised as sp+offset at each use.
+			return nil
+		}
 		off := e.allocas[in.Dst]
 		e.addrSp(off, "t0")
 		return e.storeDst(in.Dst, "t0")
@@ -1071,13 +1115,13 @@ func (e *rv32) emitCall(in *Inst) error {
 			if err := e.loadPair(v, "t0", "t1"); err != nil {
 				return err
 			}
-			e.storeSlot(p.word*4, "t0")
-			e.storeSlot(p.word*4+4, "t1")
+			e.storeSlotKeep(p.word*4, "t0")
+			e.storeSlotKeep(p.word*4+4, "t1")
 		} else {
 			if err := e.loadVal(v, "t0"); err != nil {
 				return err
 			}
-			e.storeSlot(p.word*4, "t0")
+			e.storeSlotKeep(p.word*4, "t0")
 		}
 	}
 	// Load register arguments.

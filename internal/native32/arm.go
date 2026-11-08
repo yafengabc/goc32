@@ -383,6 +383,26 @@ func highReg(reg string) bool {
 }
 
 func (e *arm) addrOf(off int, reg string) {
+	// Thumb-1 ADD (SP plus immediate) reaches #1020 in one instruction.
+	// For larger frames start with that and add the rest in 8-bit chunks;
+	// the old mov+adds loop spent five instructions on a 1 KiB offset.
+	if off >= 0 && off%4 == 0 {
+		first := off
+		if first > 1020 {
+			first = 1020
+		}
+		e.line("add %s, sp, #%d", reg, first)
+		off -= first
+		for off > 0 {
+			n := off
+			if n > 255 {
+				n = 255
+			}
+			e.line("adds %s, #%d", reg, n)
+			off -= n
+		}
+		return
+	}
 	e.line("mov %s, sp", reg)
 	for off > 0 {
 		n := off

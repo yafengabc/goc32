@@ -98,22 +98,33 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 432,508 | 87,630 | 4.94x |
-| LZ4TOS total | 263,615 | 66,850 | 3.94x |
+| raw ELF total | 307,036 | 87,630 | 3.50x |
+| LZ4TOS total | 157,953 | 66,850 | 2.36x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 3,480 / 2,425 | 998 / 724 |
-| `hello_printf` | 8,692 / 5,797 | 1,606 / 1,202 |
-| `reloc` | 4,440 / 3,036 | 1,142 / 856 |
-| `wheap` | 10,824 / 7,081 | 1,974 / 1,550 |
-| `sh` | 83,908 / 41,654 | 16,054 / 12,589 |
+| `hello` | 2,680 / 1,648 | 998 / 724 |
+| `hello_printf` | 6,036 / 3,028 | 1,606 / 1,202 |
+| `reloc` | 3,288 / 2,027 | 1,142 / 856 |
+| `wheap` | 7,592 / 3,845 | 1,974 / 1,550 |
+| `sh` | 58,244 / 27,659 | 16,054 / 12,589 |
+
+The difference from the first measurement (4.94x raw / 3.94x compressed) is
+almost all the RV32 peephole pass: a per-basic-block slot cache forwards a
+load from the register that already holds the value, deletes a store whose
+slot is never read, drops zero-offset GEPs, and retargets a producer into an
+immediate copy destination. Alloca pointers are rematerialised as `sp+offset`
+instead of taking a pointer slot. Stores another function reads (outgoing
+stack arguments and the vararg save area) are marked `# goc32keep` so the
+dead-store rule cannot touch them.
 
 Thumb output is roughly another 1.7-2x larger than RV32 because Thumb-1 cannot
 encode most immediates or long branches directly; those become literal-pool
-words and branch islands.
+words and branch islands. The ARM emitter now forms a frame address with a
+single `add r4, sp, #imm` up to 1 KiB instead of `mov` plus several `adds`,
+which cut the ARM `sh` image from 199 KiB to 147 KiB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once; goc32's unoptimised
