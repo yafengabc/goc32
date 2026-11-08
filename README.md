@@ -98,33 +98,44 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 307,036 | 87,630 | 3.50x |
-| LZ4TOS total | 157,953 | 66,850 | 2.36x |
+| raw ELF total | 289,660 | 87,630 | 3.31x |
+| LZ4TOS total | 149,725 | 66,850 | 2.24x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 2,680 / 1,648 | 998 / 724 |
-| `hello_printf` | 6,036 / 3,028 | 1,606 / 1,202 |
-| `reloc` | 3,288 / 2,027 | 1,142 / 856 |
-| `wheap` | 7,592 / 3,845 | 1,974 / 1,550 |
-| `sh` | 58,244 / 27,659 | 16,054 / 12,589 |
+| `hello` | 2,616 / 1,662 | 998 / 724 |
+| `hello_printf` | 5,716 / 3,074 | 1,606 / 1,202 |
+| `reloc` | 3,224 / 2,017 | 1,142 / 856 |
+| `wheap` | 7,176 / 3,885 | 1,974 / 1,550 |
+| `sh` | 56,516 / 23,745 | 16,054 / 12,589 |
 
-The difference from the first measurement (4.94x raw / 3.94x compressed) is
-almost all the RV32 peephole pass: a per-basic-block slot cache forwards a
-load from the register that already holds the value, deletes a store whose
-slot is never read, drops zero-offset GEPs, and retargets a producer into an
-immediate copy destination. Alloca pointers are rematerialised as `sp+offset`
-instead of taking a pointer slot. Stores another function reads (outgoing
-stack arguments and the vararg save area) are marked `# goc32keep` so the
-dead-store rule cannot touch them.
+The first measurement was 4.94x raw / 3.94x compressed.  The reduction comes
+from several passes:
+
+- a per-basic-block RV32 peephole forwards a load from the register that
+  already holds the value, deletes a store whose slot is never read, drops
+  zero-offset GEPs, sinks a small constant into the consuming ALU instruction
+  (`li t1,4; add` becomes `addi`), turns multiply-by-power-of-two into a
+  shift, and removes a jump to the following label;
+- dead pure SSA computations are removed before code generation;
+- alloca pointers are rematerialised as `sp+offset` instead of taking a slot;
+- stores another function reads (outgoing stack arguments and the vararg save
+  area) are marked `# goc32keep` so dead-store elimination cannot touch them.
+
+Small functions keep a unique slot per value, which lets the peephole prove
+stores dead per value.  Functions whose unique frame would exceed 2 KiB use a
+per-block slot pool instead: values live only inside one block share slots by
+liveness, keeping frame offsets small.  That is what takes `deep`'s recursive
+frame from 4,400 to 2,224 bytes and shrinks the big programs.
 
 Thumb output is roughly another 1.7-2x larger than RV32 because Thumb-1 cannot
 encode most immediates or long branches directly; those become literal-pool
-words and branch islands. The ARM emitter now forms a frame address with a
-single `add r4, sp, #imm` up to 1 KiB instead of `mov` plus several `adds`,
-which cut the ARM `sh` image from 199 KiB to 147 KiB.
+words and branch islands.  The ARM emitter uses the 12-bit `[sp,#off]` form on
+ARMv7-M/ARMv8-M, one `add r4, sp, #imm` for ARMv6-M up to 1 KiB, and an inline
+literal for larger offsets.  ARM `sh` is 93 KiB on the Cortex-M3 target and
+123 KiB for the RP2040, down from 199 KiB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once; goc32's unoptimised
@@ -152,10 +163,13 @@ tinyos/goc/             usys.h shim + __tos_syscall for ecall/svc
 
 The back ends cover the integer/pointer/array/struct/function/variadic subset
 used by `user/lib.c` and the small user programs. Floating point, `long double`,
-atomics, TLS, inline asm, and optimisation are not implemented yet. Values live
-in frame slots (a stack machine), so correctness comes before speed.
+atomics, TLS and inline asm are not implemented yet. Values live in frame slots
+(a stack machine); the local peephole and slot reuse above shrink the output,
+but there is no register allocator, so correctness and size still come before
+speed.
 
-ARM output is the ARMv6-M subset, so the same code runs on the RP2040 and the
-RP2350/M33; `-mcpu` records the intended board. ARM links currently need
-`-z notext` because Thumb-1's out-of-range branches and symbol literals are
-absolute words in `.text`; TinyOS's loader already applies `R_ARM_ABS32`.
+`rp2040` emits the ARMv6-M subset; `arm` (Cortex-M3) and `rp2350` (Cortex-M33)
+use the wider Thumb-2 offset forms, so binaries are built per board. ARM links
+currently need `-z notext` because Thumb-1's out-of-range branches and symbol
+literals are absolute words in `.text`; TinyOS's loader already applies
+`R_ARM_ABS32`.

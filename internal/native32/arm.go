@@ -8,6 +8,7 @@ package native32
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +28,7 @@ type arm struct {
 	cur      string
 	seq      int
 	v6m      bool
+	wide     bool
 }
 
 func EmitARM(m *Module, cpu string) (string, error) {
@@ -35,6 +37,7 @@ func EmitARM(m *Module, cpu string) (string, error) {
 	// range, so a huge basic block can put the next pool out of reach. Take
 	// the inline-literal path there; ARMv7-M/ARMv8-M keep the compact pools.
 	e.v6m = strings.HasPrefix(cpu, "cortex-m0") || strings.HasPrefix(cpu, "cortex-m1")
+	e.wide = !e.v6m
 	e.b.WriteString("\t.syntax unified\n\t.thumb\n\t.text\n")
 	for _, g := range m.Globals {
 		e.emitGlobal(g)
@@ -63,6 +66,13 @@ func (e *arm) litLoad(reg, expr string) {
 		e.line("ldr %s, =%s", reg, expr)
 		return
 	}
+	e.litInline(reg, expr)
+}
+
+// litInline emits a word immediately behind a short branch.  It works on every
+// Thumb target and, unlike the block-end literal pool, stays in range no
+// matter how large the basic block grows.
+func (e *arm) litInline(reg, expr string) {
 	n := e.seq
 	e.seq++
 	e.line("ldr %s, .Llit%d", reg, n)
@@ -217,55 +227,12 @@ func (e *arm) emitFunc(f *Func) error {
 	// sp-relative range. It is callee-saved and sits at a low offset so the
 	// prologue can store it before it is used.
 	r4Off := cur
-	cur += 4
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Dst == "" {
-				continue
-			}
-			ty := in.Ty
-			if ty == nil {
-				ty = &Type{Kind: KPtr}
-			}
-			sz := ty.Size()
-			if sz < 4 {
-				sz = 4
-			}
-			cur = align(cur, 4)
-			if in.Op == "alloca" {
-				cur = align(cur, in.Ty.Align())
-				e.allocas[in.Dst] = cur
-				cur += in.Ty.Size()
-			}
-			cur = align(cur, 4)
-			e.slots[in.Dst] = cur
-			e.slotTy[in.Dst] = ty
-			cur += sz
-		}
-	}
-	for _, p := range f.Params {
-		sz := p.Ty.Size()
-		if sz < 4 {
-			sz = 4
-		}
-		cur = align(cur, 4)
-		e.slots[p.Name] = cur
-		e.slotTy[p.Name] = p.Ty
-		cur += sz
-	}
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Op == "phi" {
-				sz := in.Ty.Size()
-				if sz < 4 {
-					sz = 4
-				}
-				cur = align(cur, 4)
-				e.phiTmp[in.Dst] = cur
-				cur += sz
-			}
-		}
-	}
+	L := layoutSlots(f, e.outBytes, 4)
+	e.slots = L.slots
+	e.allocas = L.allocas
+	e.phiTmp = L.phiTmp
+	e.slotTy = L.slotTy
+	cur = L.end
 	// lr save slot below the vararg area; the area must end at sp+frame so
 	// the caller's stack arguments continue it.
 	cur = align(cur, 4)
@@ -340,11 +307,14 @@ func (e *arm) emitFunc(f *Func) error {
 }
 
 func (e *arm) storeSlotReg(off int, reg string) {
-	// 5-bit scaled immediate: the largest [sp, #imm] Thumb-1 can encode is
-	// #124. Restricting to that keeps one binary valid on both ARMv6-M
-	// (RP2040) and ARMv7-M/ARMv8-M, and the address-forming path below
-	// takes over for anything larger.
-	if off%4 == 0 && off >= 0 && off <= 124 {
+	// ARMv6-M can encode only a 5-bit scaled offset (#124); ARMv7-M and
+	// ARMv8-M also have the 12-bit form (#4095), which keeps big frames
+	// from paying for an address calculation on every access.
+	limit := 124
+	if e.wide {
+		limit = 4095
+	}
+	if off >= 0 && off <= limit && off%4 == 0 {
 		e.line("str %s, [sp, #%d]", reg, off)
 		return
 	}
@@ -354,7 +324,11 @@ func (e *arm) storeSlotReg(off int, reg string) {
 }
 
 func (e *arm) loadSlot(off int, reg string) {
-	if off%4 == 0 && off >= 0 && off <= 124 {
+	limit := 124
+	if e.wide {
+		limit = 4095
+	}
+	if off >= 0 && off <= limit && off%4 == 0 {
 		e.line("ldr %s, [sp, #%d]", reg, off)
 		return
 	}
@@ -387,6 +361,13 @@ func (e *arm) addrOf(off int, reg string) {
 	// For larger frames start with that and add the rest in 8-bit chunks;
 	// the old mov+adds loop spent five instructions on a 1 KiB offset.
 	if off >= 0 && off%4 == 0 {
+		// Past a few KiB, a literal word plus `add reg, sp` is shorter (and
+		// always in range) than a chain of 255-byte adds.
+		if off > 2500 {
+			e.litInline(reg, strconv.Itoa(off))
+			e.line("add %s, sp", reg)
+			return
+		}
 		first := off
 		if first > 1020 {
 			first = 1020
@@ -442,6 +423,10 @@ func (e *arm) adjustSP(n int) {
 func (e *arm) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if off, ok := e.allocas[v.Name]; ok {
+			e.addrOf(off, reg)
+			return nil
+		}
 		off, ok := e.slots[v.Name]
 		if !ok {
 			return fmt.Errorf("unknown local %%%s", v.Name)
@@ -498,6 +483,9 @@ func (e *arm) loadPair(v Value, lo, hi string) error {
 func (e *arm) emitInst(in *Inst) error {
 	switch in.Op {
 	case "alloca":
+		if _, ok := e.slots[in.Dst]; !ok {
+			return nil
+		}
 		e.addrOf(e.allocas[in.Dst], "r0")
 		return e.storeDst(in.Dst, "r0")
 	case "load":

@@ -234,80 +234,16 @@ func (e *rv32) emitFunc(f *Func) error {
 	}
 	e.outBytes = align(maxStack*4, 8)
 
-	// Pass 2: assign a slot to every SSA value and an object to every alloca.
-	// An alloca's pointer is rematerialised as `sp+offset` at each use, so it
-	// needs a pointer slot only when a phi copies the pointer (phi moves read
-	// the slot directly).
-	phiVals := map[string]bool{}
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Op != "phi" {
-				continue
-			}
-			for _, op := range in.Ops {
-				if op.Kind == VLocal {
-					phiVals[op.Name] = true
-				}
-			}
-		}
-	}
-	cur := e.outBytes
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Dst == "" {
-				continue
-			}
-			ty := in.Ty
-			if ty == nil {
-				ty = &Type{Kind: KPtr}
-			}
-			sz := ty.Size()
-			if sz < 4 {
-				sz = 4
-			}
-			cur = align(cur, min(8, max(4, ty.Align())))
-			if in.Op == "alloca" {
-				cur = align(cur, in.Ty.Align())
-				e.allocas[in.Dst] = cur
-				cur += in.Ty.Size()
-				if cur < 4 {
-					cur = 4
-				}
-				if !phiVals[in.Dst] {
-					continue
-				}
-			}
-			cur = align(cur, 4)
-			e.slots[in.Dst] = cur
-			e.slotTy[in.Dst] = ty
-			cur += sz
-		}
-	}
-	// Parameter slots.
-	for _, p := range f.Params {
-		sz := p.Ty.Size()
-		if sz < 4 {
-			sz = 4
-		}
-		cur = align(cur, 4)
-		e.slots[p.Name] = cur
-		e.slotTy[p.Name] = p.Ty
-		cur += sz
-	}
-	// Phi temporary slots.
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Op == "phi" {
-				sz := in.Ty.Size()
-				if sz < 4 {
-					sz = 4
-				}
-				cur = align(cur, 4)
-				e.phiTmp[in.Dst] = cur
-				cur += sz
-			}
-		}
-	}
+	// Pass 2: assign slots.  Permanent values (parameters, values live
+	// across blocks, wide values) keep dedicated slots; short-lived words
+	// share a per-block pool.  Alloca pointers are rematerialised as
+	// sp+offset unless a phi copies them.
+	L := layoutSlots(f, e.outBytes, 0)
+	e.slots = L.slots
+	e.allocas = L.allocas
+	e.phiTmp = L.phiTmp
+	e.slotTy = L.slotTy
+	cur := L.end
 	// ra save slot, below the vararg save area.
 	cur = align(cur, 4)
 	raOff := cur

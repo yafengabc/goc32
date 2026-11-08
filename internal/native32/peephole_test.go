@@ -57,3 +57,44 @@ func TestPeepholeDoesNotFoldLiveTemporary(t *testing.T) {
 		t.Fatalf("live temporary folded:\n%s", out)
 	}
 }
+
+func TestPeepholeKeepsZeroReadByLaterInstruction(t *testing.T) {
+	// The second mul reads t0 before overwriting it, so the zero definition
+	// cannot be folded into the store.
+	out := peepholeRV32(funcText(
+		"\tli t0, 0\n\tsw t0, 4(sp)\n\tli t1, 4\n\tmul t0, t0, t1\n\tsw t0, 8(sp)\n\tret\n"))
+	if !strings.Contains(out, "li t0, 0") {
+		t.Fatalf("zero killed while still live:\n%s", out)
+	}
+}
+
+func TestPeepholeFoldsImmediateIntoAdd(t *testing.T) {
+	out := peepholeRV32(funcText("\tli t1, 4\n\tadd t0, t0, t1\n\tret\n"))
+	if !strings.Contains(out, "addi t0, t0, 4") || strings.Contains(out, "li t1, 4") {
+		t.Fatalf("immediate not folded:\n%s", out)
+	}
+}
+
+func TestPeepholeTurnsMultiplyByPowerOfTwoIntoShift(t *testing.T) {
+	out := peepholeRV32(funcText("\tli t1, 4\n\tmul t0, t0, t1\n\tret\n"))
+	if !strings.Contains(out, "slli t0, t0, 2") {
+		t.Fatalf("multiply not turned into a shift:\n%s", out)
+	}
+}
+
+func TestPeepholeKeepsImmediateUsedTwice(t *testing.T) {
+	out := peepholeRV32(funcText("\tli t1, 4\n\tadd t0, t0, t1\n\tadd t2, t2, t1\n\tret\n"))
+	if !strings.Contains(out, "li t1, 4") {
+		t.Fatalf("constant folded while still live:\n%s", out)
+	}
+}
+
+func TestPeepholeDoesNotFoldDestinationRead(t *testing.T) {
+	// add t0, t0, t1 reads the old t0, so folding la into a0 while deleting
+	// the move would lose the value the add needs.
+	out := peepholeRV32(funcText(
+		"\tla t0, sym\n\tmv a0, t0\n\tadd t0, t0, t1\n\tret\n"))
+	if !strings.Contains(out, "la t0, sym") || !strings.Contains(out, "mv a0, t0") {
+		t.Fatalf("destination read missed:\n%s", out)
+	}
+}
