@@ -19,7 +19,60 @@ var armInvert = map[string]string{
 	"bgt": "ble", "ble": "bgt",
 }
 
-func armPeephole(src string) string {
+func armPeephole(src string, wide bool) string {
+	return armJumpPeephole(armShrinkTrampolines(src, wide))
+}
+
+// armShrinkTrampolines replaces the emitter's long-branch trampoline
+//
+//	ldr r3, .LbrN
+//	mov pc, r3
+//	.balign 4
+//
+// .LbrN:
+//
+//	.word TARGET
+//
+// with a direct branch when the target is in range.  On ARMv7-M/ARMv8-M a
+// plain `b` assembles to the 32-bit form at any distance; on Thumb-1 the
+// line-distance guard keeps it inside the short branch range.
+func armShrinkTrampolines(src string, wide bool) string {
+	lines := strings.Split(src, "\n")
+	labelPos := map[string]int{}
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "\t") {
+			s := strings.TrimSpace(line)
+			if strings.HasSuffix(s, ":") {
+				labelPos[strings.TrimSuffix(s, ":")] = i
+			}
+		}
+	}
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if i+4 < len(lines) {
+			f := strings.Fields(strings.TrimSpace(lines[i]))
+			g := strings.Fields(strings.TrimSpace(lines[i+1]))
+			if len(f) == 3 && f[0] == "ldr" && strings.TrimSuffix(f[1], ",") == "r3" && strings.HasPrefix(f[2], ".Lbr") &&
+				len(g) == 3 && g[0] == "mov" && strings.TrimSuffix(g[1], ",") == "pc" && g[2] == "r3" &&
+				strings.TrimSpace(lines[i+2]) == ".balign 4" &&
+				strings.TrimSpace(lines[i+3]) == f[2]+":" {
+				w := strings.Fields(strings.TrimSpace(lines[i+4]))
+				if len(w) == 2 && w[0] == ".word" {
+					target := w[1]
+					if pos, ok := labelPos[target]; wide || (ok && absInt(pos-i) <= 200) {
+						out = append(out, "\tb "+target)
+						i += 4
+						continue
+					}
+				}
+			}
+		}
+		out = append(out, lines[i])
+	}
+	return strings.Join(out, "\n")
+}
+
+func armJumpPeephole(src string) string {
 	lines := strings.Split(src, "\n")
 	labelPos := map[string]int{}
 	for i, line := range lines {

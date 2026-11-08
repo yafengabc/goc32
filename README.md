@@ -146,10 +146,20 @@ The same register-variable and parameter-store fusion runs on Thumb, using
 parameters straight from `r0-r3`.  Thumb GEPs consume an already-loaded base
 or index directly and fold small offsets into `adds`; a conditional branch is
 inverted when no literal pool sits between it and its fallthrough target, and
-`.ltorg` is emitted only for blocks that actually use a pool.  The emitter
-also uses the 12-bit `[sp,#off]` form on ARMv7-M/v8-M and an inline literal
-for very large frame offsets.  ARM `sh` is 73 KB on the Cortex-M3 target and
-84 KB for the RP2040, down from 199 KB.
+`.ltorg` is emitted only for blocks that actually use a pool.
+
+A large part of the old Thumb size was the conservative long-branch
+trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
+.balign 4; .word target`, and `sh` had 1,665 of them (6.6 KiB of words plus
+instructions).  The post-pass now replaces a trampoline with a direct branch
+when its target is in range (always on ARMv7-M/v8-M, line-distance guarded on
+ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
+sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
+is past 124, two-operand ALU operations need a setting `movs`, only `r5-r7`
+can hold register variables, and constants/symbol addresses use literal
+pools.  ARM `sh` is now 38 KB on the Cortex-M3 target and 51 KB for the
+RP2040, down from 72 KB / 84 KB before the trampoline rewrite and 199 KB
+originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once; goc32's unoptimised

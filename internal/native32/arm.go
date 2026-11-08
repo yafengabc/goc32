@@ -60,7 +60,7 @@ func EmitARM(m *Module, cpu string) (string, error) {
 		}
 	}
 	e.b.WriteString("\t.section .note.GNU-stack,\"\",%progbits\n")
-	return armPeephole(e.b.String()), nil
+	return armPeephole(e.b.String(), e.wide), nil
 }
 
 func (e *arm) symAddr(reg, name string) {
