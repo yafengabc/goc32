@@ -347,6 +347,14 @@ func (e *arm) loadSlot(off int, reg string) {
 		limit = 4095
 	}
 	if off >= 0 && off <= limit && off%4 == 0 {
+		if e.v6m && highReg(reg) {
+			// Thumb-1 ldr takes only low registers for Rt.  (The wide
+			// targets can encode a high Rt in the 32-bit form.)
+			e.addrOf(off, "r4")
+			e.line("ldr r4, [r4]")
+			e.line("mov %s, r4", reg)
+			return
+		}
 		e.line("ldr %s, [sp, #%d]", reg, off)
 		return
 	}

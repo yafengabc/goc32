@@ -54,6 +54,79 @@ func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []str
 	return vars, used
 }
 
+func remainingRegs(all, used []string) []string {
+	taken := map[string]bool{}
+	for _, r := range used {
+		taken[r] = true
+	}
+	var out []string
+	for _, r := range all {
+		if !taken[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// planParamRegs gives immutable parameters with a high use count a
+// callee-saved register too.  A parameter used as a phi source is skipped:
+// the phi copy reads its memory slot directly.
+func planParamRegs(f *Func, regs []string, minCount int) (map[string]string, []string) {
+	uses := map[string]int{}
+	phiUse := map[string]bool{}
+	for _, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			for _, op := range in.Ops {
+				if op.Kind == VLocal {
+					uses[op.Name]++
+				}
+			}
+			for _, c := range in.Cases {
+				if c.Val.Kind == VLocal {
+					uses[c.Val.Name]++
+				}
+			}
+			if in.Indirect && in.Callee != "" {
+				uses[in.Callee]++
+			}
+			if in.Op == "phi" {
+				for _, op := range in.Ops {
+					if op.Kind == VLocal {
+						phiUse[op.Name] = true
+					}
+				}
+			}
+		}
+	}
+	type cand struct {
+		name string
+		n    int
+	}
+	var cs []cand
+	for _, p := range f.Params {
+		if p.Ty == nil || p.Ty.Size() != 4 || phiUse[p.Name] || uses[p.Name] < minCount {
+			continue
+		}
+		cs = append(cs, cand{p.Name, uses[p.Name]})
+	}
+	sort.Slice(cs, func(i, j int) bool {
+		if cs[i].n != cs[j].n {
+			return cs[i].n > cs[j].n
+		}
+		return cs[i].name < cs[j].name
+	})
+	out := map[string]string{}
+	var used []string
+	for i, c := range cs {
+		if i >= len(regs) {
+			break
+		}
+		out[c.name] = regs[i]
+		used = append(used, regs[i])
+	}
+	return out, used
+}
+
 func analyzeAllocas(f *Func) (map[string]bool, map[string]int, map[string]int) {
 	type info struct {
 		direct bool

@@ -50,7 +50,7 @@ func (e *irEmitter) lvalue(x frontend.Expr) string {
 			ety = &frontend.Type{Kind: frontend.KInt, Width: 1}
 		}
 		r := e.newTmp()
-		e.line("%s = getelementptr inbounds %s, ptr %s, i64 %s", r, e.ty(ety), base, idx)
+		e.line("%s = getelementptr inbounds %s, ptr %s, i32 %s", r, e.ty(ety), base, idx)
 		return r
 	case *frontend.MemberExpr:
 		return e.memberAddr(n)
@@ -98,7 +98,10 @@ func (e *irEmitter) indexOperands(n *frontend.Index) (string, string) {
 
 func (e *irEmitter) indexValue(x frontend.Expr) string {
 	v := e.eval(x)
-	return e.convert(v.op, v.ty, &frontend.Type{Kind: frontend.KInt, Width: 8})
+	// Addresses are 32-bit on both targets, so a GEP index is i32.  Widening
+	// it to i64 (the old code) made every subscript materialise a 64-bit pair
+	// and reload the low word right afterwards.
+	return e.convert(v.op, v.ty, &frontend.Type{Kind: frontend.KInt, Width: 4})
 }
 
 // --- calls ------------------------------------------------------------------

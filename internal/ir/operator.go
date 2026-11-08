@@ -340,13 +340,12 @@ func (e *irEmitter) toInt(v val, t *frontend.Type) string {
 }
 
 func (e *irEmitter) ptrAdd(p val, i val, pt *frontend.Type, sub bool) val {
-	// Pointers are 32-bit on both targets.  A GEP lets the back end scale the
-	// index in a single 32-bit multiply/add; the old ptrtoint/mul/add/
-	// inttoptr form forced the whole expression through an i64 carry chain.
-	idx := e.toI64(i)
+	// Pointers are 32-bit on both targets.  A GEP with an i32 index lets the
+	// back end scale and add in one 32-bit operation.
+	idx := e.convert(i.op, i.ty, &frontend.Type{Kind: frontend.KInt, Width: 4})
 	if sub {
 		neg := e.newTmp()
-		e.line("%s = sub i64 0, %s", neg, idx)
+		e.line("%s = sub i32 0, %s", neg, idx)
 		idx = neg
 	}
 	elem := pt.Elem
@@ -354,7 +353,7 @@ func (e *irEmitter) ptrAdd(p val, i val, pt *frontend.Type, sub bool) val {
 		elem = &frontend.Type{Kind: frontend.KInt, Width: 1}
 	}
 	t := e.newTmp()
-	e.line("%s = getelementptr inbounds %s, ptr %s, i64 %s", t, e.ty(elem), p.op, idx)
+	e.line("%s = getelementptr inbounds %s, ptr %s, i32 %s", t, e.ty(elem), p.op, idx)
 	return val{op: t, ty: pt}
 }
 

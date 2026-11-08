@@ -99,33 +99,32 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 181,772 | 87,630 | 2.07x |
-| LZ4TOS total | 120,064 | 66,850 | 1.80x |
+| raw ELF total | 169,100 | 87,630 | 1.93x |
+| LZ4TOS total | 110,746 | 66,850 | 1.66x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,848 / 1,379 | 998 / 724 |
-| `hello_printf` | 3,604 / 2,398 | 1,606 / 1,202 |
-| `reloc` | 2,392 / 1,730 | 1,142 / 856 |
-| `wheap` | 4,616 / 3,102 | 1,974 / 1,550 |
-| `sh` | 31,044 / 18,295 | 16,054 / 12,589 |
+| `hello` | 1,752 / 1,286 | 998 / 724 |
+| `hello_printf` | 3,380 / 2,217 | 1,606 / 1,202 |
+| `reloc` | 2,264 / 1,619 | 1,142 / 856 |
+| `wheap` | 4,360 / 2,884 | 1,974 / 1,550 |
+| `sh` | 28,132 / 16,502 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
 
 - array subscripts and pointer arithmetic now emit a real `getelementptr`
-  instead of `ptrtoint -> mul i64 -> add i64 -> inttoptr`, which used to drag
-  every index through a 64-bit carry chain;
+  with an i32 index instead of `ptrtoint -> mul i64 -> add i64 -> inttoptr`;
+  the old form dragged every subscript through a 64-bit pair and carry chain;
 - a non-escaping scalar local (`char`, `short`, `int`, pointer, double) is
   addressed directly as `sp+offset` for its loads and stores, so the alloca
   pointer is never materialised and the object needs no pointer slot;
-- a non-escaping word local that is read or written at least six times is
+- a non-escaping word local that is read or written at least four times is
   kept in a callee-saved register (`s0-s7` on RV32).  A load is a snapshot of
   that register, so its uses can read the register directly instead of a
-  stack slot; a store updates it.  The prologue saves and the epilogue
-  restores the registers actually used;
+  stack slot; a store updates it.  Hot parameters use the remaining registers;
 - dead pure SSA computations are removed before code generation;
 - the RV32 peephole forwards loads, deletes dead stores, sinks small constants
   into ALU instructions, turns multiply/divide by a power of two into shifts,
@@ -137,7 +136,7 @@ Thumb output is still larger because Thumb-1 cannot encode most immediates or
 long branches directly; those become literal-pool words and branch islands.
 The ARM emitter uses the 12-bit `[sp,#off]` form on ARMv7-M/ARMv8-M, one
 `add r4, sp, #imm` for ARMv6-M up to 1 KiB, and an inline literal for larger
-offsets.  ARM `sh` is 82 KiB on the Cortex-M3 target and 98 KiB for the
+offsets.  ARM `sh` is 77 KiB on the Cortex-M3 target and 90 KiB for the
 RP2040, down from 199 KiB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB

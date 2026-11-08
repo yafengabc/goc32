@@ -22,6 +22,7 @@ type rv32 struct {
 	allocas  map[string]int
 	direct   map[string]bool
 	regVar   map[string]string
+	paramReg map[string]string
 	sRegs    []string
 	sRegOff  map[string]int
 	regAlias map[string]string
@@ -248,9 +249,11 @@ func (e *rv32) emitFunc(f *Func) error {
 	// share a per-block pool.  Alloca pointers are rematerialised as
 	// sp+offset unless a phi copies them.
 	e.direct = findDirectAllocas(f)
-	e.regVar, e.sRegs = planRegVars(f, []string{
-		"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-	}, 6)
+	regs := []string{"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"}
+	e.regVar, e.sRegs = planRegVars(f, regs, 4)
+	var usedParams []string
+	e.paramReg, usedParams = planParamRegs(f, remainingRegs(regs, e.sRegs), 3)
+	e.sRegs = append(e.sRegs, usedParams...)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
 	L := layoutSlots(f, e.outBytes, 0)
@@ -297,7 +300,8 @@ func (e *rv32) emitFunc(f *Func) error {
 			e.storeSlotKeep(e.saveOff+i*4, fmt.Sprintf("a%d", i))
 		}
 	}
-	// Spill parameters.
+	// Spill parameters.  A hot word parameter goes straight into its
+	// callee-saved register instead of a memory slot.
 	ri := 0
 	for _, p := range f.Params {
 		sz := p.Ty.Size()
@@ -307,6 +311,16 @@ func (e *rv32) emitFunc(f *Func) error {
 		}
 		off := e.slots[p.Name]
 		for w := 0; w < words; w++ {
+			if reg := e.paramReg[p.Name]; reg != "" && words == 1 {
+				if ri < 8 {
+					e.line("mv %s, a%d", reg, ri)
+				} else {
+					e.loadSlot(e.frame+(ri-8)*4, "t0")
+					e.line("mv %s, t0", reg)
+				}
+				ri++
+				continue
+			}
 			if ri < 8 {
 				e.storeSlot(off+w*4, fmt.Sprintf("a%d", ri))
 			} else {
@@ -494,6 +508,10 @@ func (e *rv32) addImm(reg string, imm int) {
 func (e *rv32) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if src, ok := e.paramReg[v.Name]; ok {
+			e.line("mv %s, %s", reg, src)
+			return nil
+		}
 		if src, ok := e.regAlias[v.Name]; ok {
 			e.line("mv %s, %s", reg, src)
 			return nil
@@ -526,6 +544,9 @@ func (e *rv32) loadVal(v Value, reg string) error {
 // the consumer can use it directly instead of making a copy in a scratch.
 func (e *rv32) loadValTo(v Value, scratch string) (string, error) {
 	if v.Kind == VLocal {
+		if src, ok := e.paramReg[v.Name]; ok {
+			return src, nil
+		}
 		if src, ok := e.regAlias[v.Name]; ok {
 			return src, nil
 		}
