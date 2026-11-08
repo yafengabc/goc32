@@ -10,11 +10,32 @@ package native32
 // value's last use has been emitted, so the pool is only as large as the
 // maximum number of simultaneously live block-local values.
 
+func blockLastUses(blk *Block) map[string]int {
+	m := map[string]int{}
+	for i, in := range blk.Insts {
+		for _, op := range in.Ops {
+			if op.Kind == VLocal {
+				m[op.Name] = i
+			}
+		}
+		for _, c := range in.Cases {
+			if c.Val.Kind == VLocal {
+				m[c.Val.Name] = i
+			}
+		}
+		if in.Indirect && in.Callee != "" {
+			m[in.Callee] = i
+		}
+	}
+	return m
+}
+
 type slotLayout struct {
 	slots   map[string]int
 	allocas map[string]int
 	phiTmp  map[string]int
 	slotTy  map[string]*Type
+	cross   map[string]bool
 	end     int
 }
 
@@ -81,6 +102,7 @@ func layoutSlots(f *Func, base, reserve int) *slotLayout {
 			}
 		}
 	}
+	L.cross = cross
 
 	cur := base + reserve
 

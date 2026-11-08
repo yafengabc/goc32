@@ -10,7 +10,7 @@ import "sort"
 // computation and the pointer load/store pair disappear.
 
 func findDirectAllocas(f *Func) map[string]bool {
-	direct, _ := analyzeAllocas(f)
+	direct, _, _ := analyzeAllocas(f)
 	out := map[string]bool{}
 	for name, ok := range direct {
 		if ok {
@@ -25,14 +25,14 @@ func findDirectAllocas(f *Func) map[string]bool {
 // escapes, every load and store of that object is visible here, so a register
 // is a faithful replacement for its memory cell across calls and blocks.
 func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []string) {
-	direct, count := analyzeAllocas(f)
+	direct, count, size := analyzeAllocas(f)
 	type cand struct {
 		name string
 		n    int
 	}
 	var cs []cand
 	for name, ok := range direct {
-		if ok && count[name] >= minCount {
+		if ok && size[name] == 4 && count[name] >= minCount {
 			cs = append(cs, cand{name, count[name]})
 		}
 	}
@@ -54,10 +54,11 @@ func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []str
 	return vars, used
 }
 
-func analyzeAllocas(f *Func) (map[string]bool, map[string]int) {
+func analyzeAllocas(f *Func) (map[string]bool, map[string]int, map[string]int) {
 	type info struct {
 		direct bool
 		count  int
+		size   int
 	}
 	allocas := map[string]*info{}
 	for _, blk := range f.Blocks {
@@ -69,11 +70,14 @@ func analyzeAllocas(f *Func) (map[string]bool, map[string]int) {
 			// back end can address without a pointer: byte, half, word and
 			// the two-word pair.  Aggregates and arrays keep the pointer path.
 			sz := in.Ty.Size()
-			allocas[in.Dst] = &info{direct: sz == 1 || sz == 2 || sz == 4 || sz == 8}
+			allocas[in.Dst] = &info{
+				direct: sz == 1 || sz == 2 || sz == 4 || sz == 8,
+				size:   sz,
+			}
 		}
 	}
 	if len(allocas) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	escape := func(v Value) {
 		if v.Kind != VLocal {
@@ -112,9 +116,11 @@ func analyzeAllocas(f *Func) (map[string]bool, map[string]int) {
 	}
 	direct := map[string]bool{}
 	count := map[string]int{}
+	size := map[string]int{}
 	for name, inf := range allocas {
 		direct[name] = inf.direct
 		count[name] = inf.count
+		size[name] = inf.size
 	}
-	return direct, count
+	return direct, count, size
 }

@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 189,564 | 87,630 | 2.16x |
-| LZ4TOS total | 124,753 | 66,850 | 1.87x |
+| raw ELF total | 181,772 | 87,630 | 2.07x |
+| LZ4TOS total | 120,064 | 66,850 | 1.80x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,880 / 1,407 | 998 / 724 |
-| `hello_printf` | 3,796 / 2,564 | 1,606 / 1,202 |
-| `reloc` | 2,424 / 1,757 | 1,142 / 856 |
-| `wheap` | 4,840 / 3,266 | 1,974 / 1,550 |
-| `sh` | 32,644 / 18,824 | 16,054 / 12,589 |
+| `hello` | 1,848 / 1,379 | 998 / 724 |
+| `hello_printf` | 3,604 / 2,398 | 1,606 / 1,202 |
+| `reloc` | 2,392 / 1,730 | 1,142 / 856 |
+| `wheap` | 4,616 / 3,102 | 1,974 / 1,550 |
+| `sh` | 31,044 / 18,295 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -121,6 +121,11 @@ after the peephole were:
 - a non-escaping scalar local (`char`, `short`, `int`, pointer, double) is
   addressed directly as `sp+offset` for its loads and stores, so the alloca
   pointer is never materialised and the object needs no pointer slot;
+- a non-escaping word local that is read or written at least six times is
+  kept in a callee-saved register (`s0-s7` on RV32).  A load is a snapshot of
+  that register, so its uses can read the register directly instead of a
+  stack slot; a store updates it.  The prologue saves and the epilogue
+  restores the registers actually used;
 - dead pure SSA computations are removed before code generation;
 - the RV32 peephole forwards loads, deletes dead stores, sinks small constants
   into ALU instructions, turns multiply/divide by a power of two into shifts,

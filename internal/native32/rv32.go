@@ -24,6 +24,11 @@ type rv32 struct {
 	regVar   map[string]string
 	sRegs    []string
 	sRegOff  map[string]int
+	regAlias map[string]string
+	aliasVar map[string]string
+	cross    map[string]bool
+	lastUse  map[string]int
+	instIdx  int
 	phiTmp   map[string]int
 	saveOff  int
 	epilogue string
@@ -243,12 +248,17 @@ func (e *rv32) emitFunc(f *Func) error {
 	// share a per-block pool.  Alloca pointers are rematerialised as
 	// sp+offset unless a phi copies them.
 	e.direct = findDirectAllocas(f)
-	e.regVar, e.sRegs = map[string]string{}, nil
+	e.regVar, e.sRegs = planRegVars(f, []string{
+		"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+	}, 6)
+	e.regAlias = map[string]string{}
+	e.aliasVar = map[string]string{}
 	L := layoutSlots(f, e.outBytes, 0)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
 	e.slotTy = L.slotTy
+	e.cross = L.cross
 	cur := L.end
 	e.sRegOff = map[string]int{}
 	for _, r := range e.sRegs {
@@ -315,7 +325,11 @@ func (e *rv32) emitFunc(f *Func) error {
 		}
 		e.label(blockLabel(f, blk.Label))
 		e.cur = blk.Label
-		for _, in := range blk.Insts {
+		e.regAlias = map[string]string{}
+		e.aliasVar = map[string]string{}
+		e.lastUse = blockLastUses(blk)
+		for i, in := range blk.Insts {
+			e.instIdx = i
 			if err := e.emitInst(in); err != nil {
 				return err
 			}
@@ -480,6 +494,10 @@ func (e *rv32) addImm(reg string, imm int) {
 func (e *rv32) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if src, ok := e.regAlias[v.Name]; ok {
+			e.line("mv %s, %s", reg, src)
+			return nil
+		}
 		if off, ok := e.allocas[v.Name]; ok {
 			e.addrSp(off, reg)
 			return nil
@@ -501,6 +519,21 @@ func (e *rv32) loadVal(v Value, reg string) error {
 		return fmt.Errorf("cannot materialise value %s", v)
 	}
 	return nil
+}
+
+// loadValTo returns the register that holds v.  A value produced by a load
+// from a register variable is already live in its callee-saved register, so
+// the consumer can use it directly instead of making a copy in a scratch.
+func (e *rv32) loadValTo(v Value, scratch string) (string, error) {
+	if v.Kind == VLocal {
+		if src, ok := e.regAlias[v.Name]; ok {
+			return src, nil
+		}
+	}
+	if err := e.loadVal(v, scratch); err != nil {
+		return "", err
+	}
+	return scratch, nil
 }
 
 func (e *rv32) storeDst(name string, reg string) error {
@@ -550,6 +583,11 @@ func (e *rv32) emitInst(in *Inst) error {
 		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
 			off := e.allocas[v.Name]
 			if reg := e.regVar[v.Name]; reg != "" {
+				if !e.cross[in.Dst] {
+					e.regAlias[in.Dst] = reg
+					e.aliasVar[in.Dst] = v.Name
+					return nil
+				}
 				e.line("mv t1, %s", reg)
 			} else if in.Ty.Size() == 8 {
 				e.loadSlot(off, "t1")
@@ -594,6 +632,32 @@ func (e *rv32) emitInst(in *Inst) error {
 	case "store":
 		if v := in.Ops[1]; v.Kind == VLocal && e.direct[v.Name] {
 			sz := in.Ty.Size()
+			if reg := e.regVar[v.Name]; reg != "" {
+				// A pending load of this variable is a snapshot of the old
+				// value.  If the snapshot is still used after this store,
+				// write it back to its slot before overwriting the register.
+				for name, av := range e.aliasVar {
+					if av != v.Name {
+						continue
+					}
+					if e.lastUse[name] > e.instIdx {
+						e.line("mv t1, %s", reg)
+						if err := e.storeDst(name, "t1"); err != nil {
+							return err
+						}
+					}
+					delete(e.regAlias, name)
+					delete(e.aliasVar, name)
+				}
+				src, err := e.loadValTo(in.Ops[0], "t0")
+				if err != nil {
+					return err
+				}
+				if src != reg {
+					e.line("mv %s, %s", reg, src)
+				}
+				return nil
+			}
 			if sz == 8 {
 				if err := e.loadPair(in.Ops[0], "t0", "t1"); err != nil {
 					return err
@@ -606,11 +670,7 @@ func (e *rv32) emitInst(in *Inst) error {
 			if err := e.loadVal(in.Ops[0], "t0"); err != nil {
 				return err
 			}
-			if reg := e.regVar[v.Name]; reg != "" {
-				e.line("mv %s, t0", reg)
-			} else {
-				e.storeSized(e.allocas[v.Name], sz, "t0")
-			}
+			e.storeSized(e.allocas[v.Name], sz, "t0")
 			return nil
 		}
 		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
@@ -730,40 +790,24 @@ func (e *rv32) emitBin(in *Inst) error {
 	if wide {
 		return e.emitBin64(in)
 	}
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	r0, err := e.loadValTo(in.Ops[0], "t0")
+	if err != nil {
 		return err
 	}
-	if err := e.loadVal(in.Ops[1], "t1"); err != nil {
+	r1, err := e.loadValTo(in.Ops[1], "t1")
+	if err != nil {
 		return err
 	}
-	switch in.Op {
-	case "add":
-		e.line("add t0, t0, t1")
-	case "sub":
-		e.line("sub t0, t0, t1")
-	case "mul":
-		e.line("mul t0, t0, t1")
-	case "sdiv":
-		e.line("div t0, t0, t1")
-	case "udiv":
-		e.line("divu t0, t0, t1")
-	case "srem":
-		e.line("rem t0, t0, t1")
-	case "urem":
-		e.line("remu t0, t0, t1")
-	case "shl":
-		e.line("sll t0, t0, t1")
-	case "lshr":
-		e.line("srl t0, t0, t1")
-	case "ashr":
-		e.line("sra t0, t0, t1")
-	case "and":
-		e.line("and t0, t0, t1")
-	case "or":
-		e.line("or t0, t0, t1")
-	case "xor":
-		e.line("xor t0, t0, t1")
+	op := map[string]string{
+		"add": "add", "sub": "sub", "mul": "mul",
+		"sdiv": "div", "udiv": "divu", "srem": "rem", "urem": "remu",
+		"shl": "sll", "lshr": "srl", "ashr": "sra",
+		"and": "and", "or": "or", "xor": "xor",
+	}[in.Op]
+	if op == "" {
+		return fmt.Errorf("unsupported binop %s", in.Op)
 	}
+	e.line("%s t0, %s, %s", op, r0, r1)
 	return e.storeDst(in.Dst, "t0")
 }
 
@@ -858,38 +902,40 @@ func (e *rv32) emitICmp(in *Inst) error {
 	if wide {
 		return e.emitICmp64(in)
 	}
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	r0, err := e.loadValTo(in.Ops[0], "t0")
+	if err != nil {
 		return err
 	}
-	if err := e.loadVal(in.Ops[1], "t1"); err != nil {
+	r1, err := e.loadValTo(in.Ops[1], "t1")
+	if err != nil {
 		return err
 	}
 	switch in.Pred {
 	case "eq":
-		e.line("xor t0, t0, t1")
+		e.line("xor t0, %s, %s", r0, r1)
 		e.line("seqz t0, t0")
 	case "ne":
-		e.line("xor t0, t0, t1")
+		e.line("xor t0, %s, %s", r0, r1)
 		e.line("snez t0, t0")
 	case "slt":
-		e.line("slt t0, t0, t1")
+		e.line("slt t0, %s, %s", r0, r1)
 	case "sgt":
-		e.line("slt t0, t1, t0")
+		e.line("slt t0, %s, %s", r1, r0)
 	case "sle":
-		e.line("slt t0, t1, t0")
+		e.line("slt t0, %s, %s", r1, r0)
 		e.line("xori t0, t0, 1")
 	case "sge":
-		e.line("slt t0, t0, t1")
+		e.line("slt t0, %s, %s", r0, r1)
 		e.line("xori t0, t0, 1")
 	case "ult":
-		e.line("sltu t0, t0, t1")
+		e.line("sltu t0, %s, %s", r0, r1)
 	case "ugt":
-		e.line("sltu t0, t1, t0")
+		e.line("sltu t0, %s, %s", r1, r0)
 	case "ule":
-		e.line("sltu t0, t1, t0")
+		e.line("sltu t0, %s, %s", r1, r0)
 		e.line("xori t0, t0, 1")
 	case "uge":
-		e.line("sltu t0, t0, t1")
+		e.line("sltu t0, %s, %s", r0, r1)
 		e.line("xori t0, t0, 1")
 	default:
 		return fmt.Errorf("unsupported icmp predicate %s", in.Pred)
@@ -1029,11 +1075,12 @@ func (e *rv32) emitBr(in *Inst) error {
 		e.line("j %s", blockLabel(e.fn, in.Labels[0]))
 		return nil
 	}
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	cond, err := e.loadValTo(in.Ops[0], "t0")
+	if err != nil {
 		return err
 	}
 	tr := e.newLabel()
-	e.line("bnez t0, %s", tr)
+	e.line("bnez %s, %s", cond, tr)
 	// false edge
 	if err := e.emitPhiCopies(in.Labels[1], e.curBlockName()); err != nil {
 		return err
@@ -1049,12 +1096,13 @@ func (e *rv32) emitBr(in *Inst) error {
 }
 
 func (e *rv32) emitSwitch(in *Inst) error {
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	cond, err := e.loadValTo(in.Ops[0], "t0")
+	if err != nil {
 		return err
 	}
 	for _, c := range in.Cases {
 		e.line("li t1, %d", c.Val.I)
-		e.line("beq t0, t1, %s", blockLabel(e.fn, c.Dest))
+		e.line("beq %s, t1, %s", cond, blockLabel(e.fn, c.Dest))
 	}
 	if err := e.emitPhiCopies(in.Labels[0], e.curBlockName()); err != nil {
 		return err
