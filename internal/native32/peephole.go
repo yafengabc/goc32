@@ -220,6 +220,7 @@ func peepholeRV32Func(lines []string) []string {
 	}
 	out = rv32FuseSetcc(rv32FoldImmediates(rv32FoldCopies(res)))
 	out = rv32FoldCopies(out)
+	out = rv32FoldAllocaAddrs(out)
 	return rv32DropJumps(rv32InvertBranches(rv32ZeroStores(out)))
 }
 
@@ -390,6 +391,112 @@ func rv32FuseSetcc(lines []string) []string {
 		}
 	}
 	return lines
+}
+
+func rv32ParseAddiSp(body string) (string, int, bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 4 || f[0] != "addi" || f[2] != "sp" {
+		return "", 0, false
+	}
+	v, err := strconv.Atoi(f[3])
+	if err != nil {
+		return "", 0, false
+	}
+	return f[1], v, true
+}
+
+// rv32ParseAddiSelf parses "addi reg, reg, imm".
+func rv32ParseAddiSelf(body, reg string) (int, bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 4 || f[0] != "addi" || f[1] != reg || f[2] != reg {
+		return 0, false
+	}
+	v, err := strconv.Atoi(f[3])
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// rv32FoldAddrAccess rewrites a load/store through a just-materialised
+// sp+off pointer into a direct sp-relative access.
+func rv32FoldAddrAccess(body, ptr string, off int) (string, bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 3 || f[2] != "0("+ptr+")" {
+		return "", false
+	}
+	switch f[0] {
+	case "lw", "sw":
+		if off%4 != 0 {
+			return "", false
+		}
+	case "lh", "lhu", "sh":
+		if off%2 != 0 {
+			return "", false
+		}
+	case "lb", "lbu", "sb":
+	default:
+		return "", false
+	}
+	if off < -2048 || off > 2047 {
+		return "", false
+	}
+	if f[0] == "sw" || f[0] == "sh" || f[0] == "sb" {
+		if f[1] == ptr {
+			return "", false // the stored value is the pointer itself
+		}
+	}
+	return "\t" + f[0] + " " + f[1] + ", " + strconv.Itoa(off) + "(sp)", true
+}
+
+// rv32FoldAllocaAddrs turns
+//
+//	addi q0, sp, OFF        addi q0, sp, OFF
+//	OP   x, 0(q0)           addi q0, q0, ADD
+//	                        OP   x, 0(q0)
+//
+// into OP x, OFF(sp) / OP x, (OFF+ADD)(sp) when the pointer temporary is dead
+// afterwards.  Direct allocas are the main source of the address arithmetic.
+func rv32FoldAllocaAddrs(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	changed := false
+	for i := 0; i < len(lines); i++ {
+		if body, _, ok := rv32Body(lines[i]); ok {
+			if p, off, ok := rv32ParseAddiSp(body); ok && rv32VolatileReg(p) {
+				if i+1 < len(lines) {
+					if nb, _, ok := rv32Body(lines[i+1]); ok {
+						if nl, ok := rv32FoldAddrAccess(nb, p, off); ok &&
+							!rv32ReadBeforeWrite(lines[i+2:], p) {
+							out = append(out, nl)
+							i++
+							changed = true
+							continue
+						}
+					}
+				}
+				if i+2 < len(lines) {
+					if b1, _, ok := rv32Body(lines[i+1]); ok {
+						if add, ok := rv32ParseAddiSelf(b1, p); ok {
+							if b2, _, ok := rv32Body(lines[i+2]); ok {
+								if nl, ok := rv32FoldAddrAccess(b2, p, off+add); ok &&
+									!rv32ReadBeforeWrite(lines[i+3:], p) {
+									out = append(out, nl)
+									i += 2
+									changed = true
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		out = append(out, lines[i])
+	}
+	if changed {
+		return rv32FoldAllocaAddrs(out)
+	}
+	return out
 }
 
 func rv32ParseXor(body string) (rd, ra, rb string, ok bool) {

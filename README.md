@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 136,636 | 87,630 | 1.56x |
-| LZ4TOS total | 97,581 | 66,850 | 1.46x |
+| raw ELF total | 136,284 | 87,630 | 1.56x |
+| LZ4TOS total | 97,367 | 66,850 | 1.46x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
 | `hello` | 1,560 / 1,116 | 998 / 724 |
-| `hello_printf` | 2,740 / 1,946 | 1,606 / 1,202 |
-| `reloc` | 2,040 / 1,440 | 1,142 / 856 |
-| `wheap` | 3,528 / 2,555 | 1,974 / 1,550 |
-| `sh` | 22,116 / 14,925 | 16,054 / 12,589 |
+| `hello_printf` | 2,740 / 1,945 | 1,606 / 1,202 |
+| `reloc` | 2,040 / 1,438 | 1,142 / 856 |
+| `wheap` | 3,528 / 2,558 | 1,974 / 1,550 |
+| `sh` | 21,988 / 14,875 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -158,6 +158,9 @@ after the peephole were:
   a bare `xori 1` flips the branch), and `xori x, y, 0` disappears; this
   removes most of the boolean materialisation the stack-machine emitter
   produces;
+- `addi p, sp, off; load/store x, 0(p)` (and the same with one GEP offset
+  folded in) becomes a direct `off(sp)` access when `p` is dead afterwards,
+  removing the alloca pointer materialisation;
 - small RV32 functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
   Thumb cares more about frame size than about per-value store proof, so it
