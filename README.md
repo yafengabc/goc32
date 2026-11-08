@@ -53,8 +53,9 @@ Targets:
 | `rp2350` | Thumb / ARMv8-M | `thumbv8m.main`, Cortex-M33 | `armelf` |
 
 Diagnostics: `-S` (assembly), `-ir` (gocl IR), `-E` (preprocessed C), `-keep`,
-`-v`, `-pack` (wrap an already linked ELF in LZ4TOS without compiling). Extra
-includes/defines: `-I`, `-D`.
+`-v`, `-pack` (wrap an already linked ELF in LZ4TOS without compiling), `-ll`
+(treat the input as LLVM IR text and emit assembly). Extra includes/defines:
+`-I`, `-D`.
 
 The compiler finds the TinyOS checkout by walking up from the input source (it
 looks for `user/lib.c`, `user/user.ld`, `include/tos.h`). Use `-tos DIR` or
@@ -98,44 +99,41 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 289,660 | 87,630 | 3.31x |
-| LZ4TOS total | 149,725 | 66,850 | 2.24x |
+| raw ELF total | 189,564 | 87,630 | 2.16x |
+| LZ4TOS total | 124,753 | 66,850 | 1.87x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 2,616 / 1,662 | 998 / 724 |
-| `hello_printf` | 5,716 / 3,074 | 1,606 / 1,202 |
-| `reloc` | 3,224 / 2,017 | 1,142 / 856 |
-| `wheap` | 7,176 / 3,885 | 1,974 / 1,550 |
-| `sh` | 56,516 / 23,745 | 16,054 / 12,589 |
+| `hello` | 1,880 / 1,407 | 998 / 724 |
+| `hello_printf` | 3,796 / 2,564 | 1,606 / 1,202 |
+| `reloc` | 2,424 / 1,757 | 1,142 / 856 |
+| `wheap` | 4,840 / 3,266 | 1,974 / 1,550 |
+| `sh` | 32,644 / 18,824 | 16,054 / 12,589 |
 
-The first measurement was 4.94x raw / 3.94x compressed.  The reduction comes
-from several passes:
+The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
+after the peephole were:
 
-- a per-basic-block RV32 peephole forwards a load from the register that
-  already holds the value, deletes a store whose slot is never read, drops
-  zero-offset GEPs, sinks a small constant into the consuming ALU instruction
-  (`li t1,4; add` becomes `addi`), turns multiply-by-power-of-two into a
-  shift, and removes a jump to the following label;
+- array subscripts and pointer arithmetic now emit a real `getelementptr`
+  instead of `ptrtoint -> mul i64 -> add i64 -> inttoptr`, which used to drag
+  every index through a 64-bit carry chain;
+- a non-escaping scalar local (`char`, `short`, `int`, pointer, double) is
+  addressed directly as `sp+offset` for its loads and stores, so the alloca
+  pointer is never materialised and the object needs no pointer slot;
 - dead pure SSA computations are removed before code generation;
-- alloca pointers are rematerialised as `sp+offset` instead of taking a slot;
-- stores another function reads (outgoing stack arguments and the vararg save
-  area) are marked `# goc32keep` so dead-store elimination cannot touch them.
+- the RV32 peephole forwards loads, deletes dead stores, sinks small constants
+  into ALU instructions, turns multiply/divide by a power of two into shifts,
+  rewrites `li 0 + sw` as `sw zero`, and drops jumps to the following label;
+- small functions keep one slot per value so the peephole can prove stores
+  dead per value; frames over 2 KiB use a per-block liveness pool instead.
 
-Small functions keep a unique slot per value, which lets the peephole prove
-stores dead per value.  Functions whose unique frame would exceed 2 KiB use a
-per-block slot pool instead: values live only inside one block share slots by
-liveness, keeping frame offsets small.  That is what takes `deep`'s recursive
-frame from 4,400 to 2,224 bytes and shrinks the big programs.
-
-Thumb output is roughly another 1.7-2x larger than RV32 because Thumb-1 cannot
-encode most immediates or long branches directly; those become literal-pool
-words and branch islands.  The ARM emitter uses the 12-bit `[sp,#off]` form on
-ARMv7-M/ARMv8-M, one `add r4, sp, #imm` for ARMv6-M up to 1 KiB, and an inline
-literal for larger offsets.  ARM `sh` is 93 KiB on the Cortex-M3 target and
-123 KiB for the RP2040, down from 199 KiB.
+Thumb output is still larger because Thumb-1 cannot encode most immediates or
+long branches directly; those become literal-pool words and branch islands.
+The ARM emitter uses the 12-bit `[sp,#off]` form on ARMv7-M/ARMv8-M, one
+`add r4, sp, #imm` for ARMv6-M up to 1 KiB, and an inline literal for larger
+offsets.  ARM `sh` is 82 KiB on the Cortex-M3 target and 98 KiB for the
+RP2040, down from 199 KiB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once; goc32's unoptimised

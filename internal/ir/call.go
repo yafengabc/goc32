@@ -41,23 +41,16 @@ func (e *irEmitter) lvalue(x frontend.Expr) string {
 		}
 	case *frontend.Index:
 		base, idx := e.indexOperands(n)
-		// A[i] is *(a + i); the element address is what is wanted.
+		// A[i] is *(a + i).  Emit a real GEP so the 32-bit back end scales
+		// the index directly; the old ptrtoint/mul/add/inttoptr sequence
+		// forced every subscript through a 64-bit carry chain.
 		ety := e.tr.exprType(n)
-		esz := frontend.Sizeof(ety)
-		if esz == 0 {
-			esz = 1
+		if ety == nil || ety.Kind == frontend.KVoid {
+			// GNU void* arithmetic: byte steps.
+			ety = &frontend.Type{Kind: frontend.KInt, Width: 1}
 		}
-		scaled := idx
-		if esz != 1 {
-			scaled = e.newTmp()
-			e.line("%s = mul i64 %s, %d", scaled, idx, esz)
-		}
-		bp := e.newTmp()
-		e.line("%s = ptrtoint ptr %s to i64", bp, base)
-		sum := e.newTmp()
-		e.line("%s = add i64 %s, %s", sum, bp, scaled)
 		r := e.newTmp()
-		e.line("%s = inttoptr i64 %s to ptr", r, sum)
+		e.line("%s = getelementptr inbounds %s, ptr %s, i64 %s", r, e.ty(ety), base, idx)
 		return r
 	case *frontend.MemberExpr:
 		return e.memberAddr(n)

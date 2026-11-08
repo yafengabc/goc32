@@ -340,34 +340,21 @@ func (e *irEmitter) toInt(v val, t *frontend.Type) string {
 }
 
 func (e *irEmitter) ptrAdd(p val, i val, pt *frontend.Type, sub bool) val {
-	esz := frontend.Sizeof(pt.Elem)
-	if esz == 0 {
-		esz = 1
-	}
-	// C's pointer arithmetic runs in the width of `ptrdiff_t`, which is 64 bits
-	// here. The subscript, however, is plain `int` -- 32 bits -- so it must be
-	// widened to i64 before the scaling and the add, or LLVM rejects the mix of
-	// an i32 subscript with an i64 base. A signed subscript is sign-extended, an
-	// unsigned one zero-extended; a pointer subscript (rare) becomes an integer
-	// with ptrtoint.
+	// Pointers are 32-bit on both targets.  A GEP lets the back end scale the
+	// index in a single 32-bit multiply/add; the old ptrtoint/mul/add/
+	// inttoptr form forced the whole expression through an i64 carry chain.
 	idx := e.toI64(i)
-	scaled := idx
-	if esz != 1 {
-		scaled = e.newTmp()
-		e.line("%s = mul i64 %s, %d", scaled, idx, esz)
-	}
-	// The base is widened to i64 to match; the result is then turned back into a
-	// pointer.
-	base := e.newTmp()
-	e.line("%s = ptrtoint ptr %s to i64", base, p.op)
-	sum := e.newTmp()
 	if sub {
-		e.line("%s = sub i64 %s, %s", sum, base, scaled)
-	} else {
-		e.line("%s = add i64 %s, %s", sum, base, scaled)
+		neg := e.newTmp()
+		e.line("%s = sub i64 0, %s", neg, idx)
+		idx = neg
+	}
+	elem := pt.Elem
+	if elem == nil || elem.Kind == frontend.KVoid {
+		elem = &frontend.Type{Kind: frontend.KInt, Width: 1}
 	}
 	t := e.newTmp()
-	e.line("%s = inttoptr i64 %s to ptr", t, sum)
+	e.line("%s = getelementptr inbounds %s, ptr %s, i64 %s", t, e.ty(elem), p.op, idx)
 	return val{op: t, ty: pt}
 }
 

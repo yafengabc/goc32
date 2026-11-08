@@ -20,6 +20,10 @@ type rv32 struct {
 	slots    map[string]int
 	slotTy   map[string]*Type
 	allocas  map[string]int
+	direct   map[string]bool
+	regVar   map[string]string
+	sRegs    []string
+	sRegOff  map[string]int
 	phiTmp   map[string]int
 	saveOff  int
 	epilogue string
@@ -238,12 +242,20 @@ func (e *rv32) emitFunc(f *Func) error {
 	// across blocks, wide values) keep dedicated slots; short-lived words
 	// share a per-block pool.  Alloca pointers are rematerialised as
 	// sp+offset unless a phi copies them.
+	e.direct = findDirectAllocas(f)
+	e.regVar, e.sRegs = map[string]string{}, nil
 	L := layoutSlots(f, e.outBytes, 0)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
 	e.slotTy = L.slotTy
 	cur := L.end
+	e.sRegOff = map[string]int{}
+	for _, r := range e.sRegs {
+		cur = align(cur, 4)
+		e.sRegOff[r] = cur
+		cur += 4
+	}
 	// ra save slot, below the vararg save area.
 	cur = align(cur, 4)
 	raOff := cur
@@ -267,6 +279,9 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.label(sym(f.Name))
 	e.adjustSP(-e.frame)
 	e.storeSlot(raOff, "ra")
+	for _, r := range e.sRegs {
+		e.storeSlot(e.sRegOff[r], r)
+	}
 	if f.Variadic {
 		for i := 0; i < 8; i++ {
 			e.storeSlotKeep(e.saveOff+i*4, fmt.Sprintf("a%d", i))
@@ -308,6 +323,9 @@ func (e *rv32) emitFunc(f *Func) error {
 	}
 	// Epilogue.
 	e.label(e.epilogue)
+	for _, r := range e.sRegs {
+		e.loadSlot(e.sRegOff[r], r)
+	}
 	e.loadSlot(raOff, "ra")
 	e.adjustSP(e.frame)
 	e.line("ret")
@@ -383,6 +401,50 @@ func (e *rv32) storeSlotKeep(off int, reg string) {
 	e.line("li %s, %d", scratch, off)
 	e.line("add %s, sp, %s", scratch, scratch)
 	e.line("sw %s, 0(%s) # goc32keep", reg, scratch)
+}
+
+// loadSized reads 1, 2 or 4 bytes from a frame offset into reg.  The direct
+// alloca path uses it so a char/short/int local costs one load and no pointer.
+func (e *rv32) loadSized(off, size int, reg string) {
+	op := "lw"
+	switch size {
+	case 1:
+		op = "lbu"
+	case 2:
+		op = "lhu"
+	}
+	if off >= -2048 && off <= 2047 {
+		e.line("%s %s, %d(sp)", op, reg, off)
+		return
+	}
+	scratch := "t5"
+	if reg == "t5" {
+		scratch = "t6"
+	}
+	e.line("li %s, %d", scratch, off)
+	e.line("add %s, sp, %s", scratch, scratch)
+	e.line("%s %s, 0(%s)", op, reg, scratch)
+}
+
+func (e *rv32) storeSized(off, size int, reg string) {
+	op := "sw"
+	switch size {
+	case 1:
+		op = "sb"
+	case 2:
+		op = "sh"
+	}
+	if off >= -2048 && off <= 2047 {
+		e.line("%s %s, %d(sp)", op, reg, off)
+		return
+	}
+	scratch := "t5"
+	if reg == "t5" {
+		scratch = "t6"
+	}
+	e.line("li %s, %d", scratch, off)
+	e.line("add %s, sp, %s", scratch, scratch)
+	e.line("%s %s, 0(%s)", op, reg, scratch)
 }
 
 func (e *rv32) addrSp(off int, reg string) {
@@ -474,6 +536,9 @@ func (e *rv32) loadPair(v Value, lo, hi string) error {
 func (e *rv32) emitInst(in *Inst) error {
 	switch in.Op {
 	case "alloca":
+		if e.direct[in.Dst] {
+			return nil
+		}
 		if _, ok := e.slots[in.Dst]; !ok {
 			// Rematerialised as sp+offset at each use.
 			return nil
@@ -482,6 +547,22 @@ func (e *rv32) emitInst(in *Inst) error {
 		e.addrSp(off, "t0")
 		return e.storeDst(in.Dst, "t0")
 	case "load":
+		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
+			off := e.allocas[v.Name]
+			if reg := e.regVar[v.Name]; reg != "" {
+				e.line("mv t1, %s", reg)
+			} else if in.Ty.Size() == 8 {
+				e.loadSlot(off, "t1")
+				e.loadSlot(off+4, "t2")
+				dst := e.slots[in.Dst]
+				e.storeSlot(dst, "t1")
+				e.storeSlot(dst+4, "t2")
+				return nil
+			} else {
+				e.loadSized(off, in.Ty.Size(), "t1")
+			}
+			return e.storeDst(in.Dst, "t1")
+		}
 		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
 			return err
 		}
@@ -511,6 +592,27 @@ func (e *rv32) emitInst(in *Inst) error {
 		}
 		return e.storeDst(in.Dst, "t1")
 	case "store":
+		if v := in.Ops[1]; v.Kind == VLocal && e.direct[v.Name] {
+			sz := in.Ty.Size()
+			if sz == 8 {
+				if err := e.loadPair(in.Ops[0], "t0", "t1"); err != nil {
+					return err
+				}
+				off := e.allocas[v.Name]
+				e.storeSlot(off, "t0")
+				e.storeSlot(off+4, "t1")
+				return nil
+			}
+			if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+				return err
+			}
+			if reg := e.regVar[v.Name]; reg != "" {
+				e.line("mv %s, t0", reg)
+			} else {
+				e.storeSized(e.allocas[v.Name], sz, "t0")
+			}
+			return nil
+		}
 		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
 			return err
 		}

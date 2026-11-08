@@ -94,6 +94,7 @@ type options struct {
 	irOnly   bool
 	preOnly  bool
 	packOnly bool
+	fromIR   bool
 	keep     bool
 	verbose  bool
 	cc       string
@@ -132,6 +133,8 @@ func main() {
 			o.preOnly = true
 		case "-pack":
 			o.packOnly = true
+		case "-ll":
+			o.fromIR = true
 		case "-keep":
 			o.keep = true
 		case "-v":
@@ -167,6 +170,7 @@ func usage() {
   -ir            emit the gocl IR only
   -E             preprocess only
   -pack          wrap an already linked ELF in LZ4TOS (no compile)
+  -ll            treat the input as LLVM IR text and emit assembly
   -keep          keep the temporary build directory
   -cc PATH       clang path (default: clang)
   -ld PATH       ld.lld path (default: ld.lld)
@@ -200,6 +204,29 @@ func run(o options) error {
 		fmt.Printf("%s: %d -> %d bytes (LZ4TOS, hint %d/%d/%d)\n",
 			out, res.RawSize, res.CompSize, res.Hint.Span, res.Hint.StackAsk, res.Hint.HeapAsk)
 		return nil
+	}
+	if o.fromIR {
+		if len(o.inputs) != 1 {
+			return fmt.Errorf("-ll takes exactly one LLVM IR file")
+		}
+		raw, err := os.ReadFile(o.inputs[0])
+		if err != nil {
+			return err
+		}
+		m, err := native32.ParseModule(string(raw))
+		if err != nil {
+			return fmt.Errorf("%s: IR parse: %w", o.inputs[0], err)
+		}
+		var asm string
+		if t.Arch == "arm" {
+			asm, err = native32.EmitARM(m, t.CPU)
+		} else {
+			asm, err = native32.EmitRV32(m)
+		}
+		if err != nil {
+			return err
+		}
+		return writeFile(outputPath(o.out, o.inputs[0], ".s"), []byte(asm))
 	}
 	tos, err := findTOS(o.tos, o.inputs[0])
 	if err != nil {

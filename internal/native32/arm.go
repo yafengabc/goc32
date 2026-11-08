@@ -21,6 +21,10 @@ type arm struct {
 	slots    map[string]int
 	slotTy   map[string]*Type
 	allocas  map[string]int
+	direct   map[string]bool
+	regVar   map[string]string
+	sRegs    []string
+	sRegOff  map[string]int
 	phiTmp   map[string]int
 	saveOff  int
 	epilogue string
@@ -227,12 +231,20 @@ func (e *arm) emitFunc(f *Func) error {
 	// sp-relative range. It is callee-saved and sits at a low offset so the
 	// prologue can store it before it is used.
 	r4Off := cur
+	e.direct = findDirectAllocas(f)
+	e.regVar, e.sRegs = map[string]string{}, nil
 	L := layoutSlots(f, e.outBytes, 4)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
 	e.slotTy = L.slotTy
 	cur = L.end
+	e.sRegOff = map[string]int{}
+	for _, r := range e.sRegs {
+		cur = align(cur, 4)
+		e.sRegOff[r] = cur
+		cur += 4
+	}
 	// lr save slot below the vararg area; the area must end at sp+frame so
 	// the caller's stack arguments continue it.
 	cur = align(cur, 4)
@@ -257,6 +269,9 @@ func (e *arm) emitFunc(f *Func) error {
 	e.label(sanitize(f.Name))
 	e.adjustSP(-e.frame)
 	e.line("str r4, [sp, #%d]", r4Off)
+	for _, r := range e.sRegs {
+		e.storeSlotReg(e.sRegOff[r], r)
+	}
 	if f.Variadic {
 		for i := 0; i < 4; i++ {
 			e.storeSlotReg(e.saveOff+i*4, fmt.Sprintf("r%d", i))
@@ -299,6 +314,9 @@ func (e *arm) emitFunc(f *Func) error {
 	}
 	e.label(e.epilogue)
 	e.loadSlot(lrOff, "r3")
+	for _, r := range e.sRegs {
+		e.loadSlot(e.sRegOff[r], r)
+	}
 	e.line("ldr r4, [sp, #%d]", r4Off)
 	e.adjustSP(e.frame)
 	e.line("bx r3")
@@ -354,6 +372,59 @@ func highReg(reg string) bool {
 		return true
 	}
 	return false
+}
+
+// loadSized reads 1, 2 or 4 bytes from a frame offset.  Direct allocas use
+// it so a char/short/int local needs no pointer materialisation.
+func (e *arm) loadSized(off, size int, reg string) {
+	op := "ldr"
+	switch size {
+	case 1:
+		op = "ldrb"
+	case 2:
+		op = "ldrh"
+	}
+	if e.smallOffset(off, size) {
+		e.line("%s %s, [sp, #%d]", op, reg, off)
+		return
+	}
+	e.addrOf(off, "r4")
+	e.line("%s %s, [r4]", op, reg)
+}
+
+func (e *arm) storeSized(off, size int, reg string) {
+	op := "str"
+	switch size {
+	case 1:
+		op = "strb"
+	case 2:
+		op = "strh"
+	}
+	if e.smallOffset(off, size) {
+		e.line("%s %s, [sp, #%d]", op, reg, off)
+		return
+	}
+	e.addrOf(off, "r4")
+	e.line("%s %s, [r4]", op, reg)
+}
+
+// smallOffset reports whether [sp,#off] fits the sized load/store encoding.
+func (e *arm) smallOffset(off, size int) bool {
+	if off < 0 {
+		return false
+	}
+	if e.wide {
+		return off <= 4095
+	}
+	switch size {
+	case 1:
+		// Thumb-1 LDRB/STRB take a low-register base, not SP.
+		return false
+	case 2:
+		return false
+	default:
+		return off%4 == 0 && off <= 124
+	}
 }
 
 func (e *arm) addrOf(off int, reg string) {
@@ -483,12 +554,31 @@ func (e *arm) loadPair(v Value, lo, hi string) error {
 func (e *arm) emitInst(in *Inst) error {
 	switch in.Op {
 	case "alloca":
+		if e.direct[in.Dst] {
+			return nil
+		}
 		if _, ok := e.slots[in.Dst]; !ok {
 			return nil
 		}
 		e.addrOf(e.allocas[in.Dst], "r0")
 		return e.storeDst(in.Dst, "r0")
 	case "load":
+		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
+			off := e.allocas[v.Name]
+			if reg := e.regVar[v.Name]; reg != "" {
+				e.line("mov r1, %s", reg)
+			} else if in.Ty.Size() == 8 {
+				e.loadSlot(off, "r1")
+				e.loadSlot(off+4, "r2")
+				dst := e.slots[in.Dst]
+				e.storeSlotReg(dst, "r1")
+				e.storeSlotReg(dst+4, "r2")
+				return nil
+			} else {
+				e.loadSized(off, in.Ty.Size(), "r1")
+			}
+			return e.storeDst(in.Dst, "r1")
+		}
 		if err := e.loadVal(in.Ops[0], "r0"); err != nil {
 			return err
 		}
@@ -517,6 +607,27 @@ func (e *arm) emitInst(in *Inst) error {
 		}
 		return e.storeDst(in.Dst, "r1")
 	case "store":
+		if v := in.Ops[1]; v.Kind == VLocal && e.direct[v.Name] {
+			sz := in.Ty.Size()
+			if sz == 8 {
+				if err := e.loadPair(in.Ops[0], "r0", "r1"); err != nil {
+					return err
+				}
+				off := e.allocas[v.Name]
+				e.storeSlotReg(off, "r0")
+				e.storeSlotReg(off+4, "r1")
+				return nil
+			}
+			if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+				return err
+			}
+			if reg := e.regVar[v.Name]; reg != "" {
+				e.line("mov %s, r0", reg)
+			} else {
+				e.storeSized(e.allocas[v.Name], sz, "r0")
+			}
+			return nil
+		}
 		if err := e.loadVal(in.Ops[0], "r0"); err != nil {
 			return err
 		}
