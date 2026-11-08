@@ -148,10 +148,14 @@ after the peephole were:
 
 The same register-variable and parameter-store fusion runs on Thumb, using
 `r5-r7` (ARMv6-M ALU instructions only encode low registers) and writing
-parameters straight from `r0-r3`.  Thumb GEPs consume an already-loaded base
-or index directly and fold small offsets into `adds`; a conditional branch is
-inverted when no literal pool sits between it and its fallthrough target, and
-`.ltorg` is emitted only for blocks that actually use a pool.
+parameters straight from `r0-r3`.  ARMv7-M/ARMv8-M extend that set with
+`r8-r11`, which Thumb-2 accepts as ALU operands and in the 32-bit
+load/store forms (ARMv6-M must stay on low registers); only the rare `muls`
+with a high operand needs a low-register copy.  Thumb GEPs consume an
+already-loaded base or index directly and fold small offsets into `adds`; a
+conditional branch is inverted when no literal pool sits between it and its
+fallthrough target, and `.ltorg` is emitted only for blocks that actually use
+a pool.
 
 A large part of the old Thumb size was the conservative long-branch
 trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
@@ -160,11 +164,11 @@ instructions).  The post-pass now replaces a trampoline with a direct branch
 when its target is in range (always on ARMv7-M/v8-M, line-distance guarded on
 ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
-is past 124, two-operand ALU operations need a setting `movs`, only `r5-r7`
-can hold register variables, and constants/symbol addresses use literal
-pools.  ARM `sh` is now 37 KB on the Cortex-M3 target and 48 KB for the
-RP2040, down from 72 KB / 84 KB before the trampoline rewrite and 199 KB
-originally.
+is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
+hold register variables only in `r5-r7`, and constants/symbol addresses use
+literal pools.  ARM `sh` is now 37,736 bytes / 24,059 compressed on the
+Cortex-M3 target and 49,276 / 26,710 for the RP2040, down from 72 KB / 84 KB
+before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once.  After the slot

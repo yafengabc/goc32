@@ -242,7 +242,14 @@ func (e *arm) emitFunc(f *Func) error {
 	// prologue can store it before it is used.
 	r4Off := cur
 	e.direct = findDirectAllocas(f)
-	e.regVar, e.sRegs = planRegVars(f, []string{"r5", "r6", "r7"}, 3)
+	regs := []string{"r5", "r6", "r7"}
+	if e.wide {
+		// Thumb-2 encodes r8-r11 as ALU operands and in the 32-bit
+		// load/store forms, so ARMv7-M/ARMv8-M can keep six more hot
+		// locals in registers.  ARMv6-M must stay on low registers.
+		regs = append(regs, "r8", "r9", "r10", "r11")
+	}
+	e.regVar, e.sRegs = planRegVars(f, regs, 3)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
 	L := layoutSlots(f, e.outBytes, 4, nil, true)
@@ -907,6 +914,16 @@ func (e *arm) emitBin(in *Inst) error {
 		e.line("subs r0, %s, %s", rA, rB)
 	case "mul":
 		toR0()
+		if highReg(rB) {
+			// MUL only encodes low registers; the high register is a
+			// Thumb-2 register-variable candidate.  A square can reuse r0.
+			if rA == rB {
+				rB = "r0"
+			} else {
+				e.line("movs r1, %s", rB)
+				rB = "r1"
+			}
+		}
 		e.line("muls r0, %s", rB)
 	case "sdiv", "udiv", "srem", "urem":
 		if rA != "r0" {
