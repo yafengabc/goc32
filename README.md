@@ -140,10 +140,13 @@ after the peephole were:
 
 The same register-variable and parameter-store fusion runs on Thumb, using
 `r5-r7` (ARMv6-M ALU instructions only encode low registers) and writing
-parameters straight from `r0-r3`.  The emitter also uses the 12-bit
-`[sp,#off]` form on ARMv7-M/v8-M and an inline literal for very large frame
-offsets.  ARM `sh` is 75 KiB on the Cortex-M3 target and 86 KiB for the
-RP2040, down from 199 KiB.
+parameters straight from `r0-r3`.  Thumb GEPs consume an already-loaded base
+or index directly and fold small offsets into `adds`; a conditional branch is
+inverted when no literal pool sits between it and its fallthrough target, and
+`.ltorg` is emitted only for blocks that actually use a pool.  The emitter
+also uses the 12-bit `[sp,#off]` form on ARMv7-M/v8-M and an inline literal
+for very large frame offsets.  ARM `sh` is 73 KB on the Cortex-M3 target and
+84 KB for the RP2040, down from 199 KB.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once; goc32's unoptimised

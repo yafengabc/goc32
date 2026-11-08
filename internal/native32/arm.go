@@ -32,6 +32,7 @@ type arm struct {
 	instIdx  int
 	paramTgt map[string]string
 	skipInst map[*Inst]bool
+	usedPool bool
 	phiTmp   map[string]int
 	saveOff  int
 	epilogue string
@@ -59,7 +60,7 @@ func EmitARM(m *Module, cpu string) (string, error) {
 		}
 	}
 	e.b.WriteString("\t.section .note.GNU-stack,\"\",%progbits\n")
-	return e.b.String(), nil
+	return armPeephole(e.b.String()), nil
 }
 
 func (e *arm) symAddr(reg, name string) {
@@ -74,6 +75,7 @@ func (e *arm) symAddr(reg, name string) {
 // kernel patches because TinyOS links these images with -z notext.
 func (e *arm) litLoad(reg, expr string) {
 	if !e.v6m {
+		e.usedPool = true
 		e.line("ldr %s, =%s", reg, expr)
 		return
 	}
@@ -220,6 +222,7 @@ func (e *arm) emitFunc(f *Func) error {
 	e.saveOff = 0
 	e.outBytes = 0
 	e.frame = 0
+	e.usedPool = false
 
 	maxStack := 0
 	for _, blk := range f.Blocks {
@@ -341,7 +344,10 @@ func (e *arm) emitFunc(f *Func) error {
 				return err
 			}
 		}
-		e.b.WriteString("\t.ltorg\n")
+		if e.usedPool {
+			e.b.WriteString("\t.ltorg\n")
+			e.usedPool = false
+		}
 	}
 	e.label(e.epilogue)
 	e.loadSlot(lrOff, "r3")
@@ -464,6 +470,31 @@ func (e *arm) smallOffset(off, size int) bool {
 	default:
 		return off%4 == 0 && off <= 124
 	}
+}
+
+// addImm adds a 32-bit constant to a low register.  Thumb-1 has an 8-bit
+// immediate add/sub, which covers almost every field offset and element step;
+// larger or negative values go through r1.
+func (e *arm) addImm(reg string, imm int) {
+	if imm == 0 {
+		return
+	}
+	if imm > 0 && imm <= 255 {
+		e.line("adds %s, #%d", reg, imm)
+		return
+	}
+	if imm < 0 && imm >= -255 {
+		e.line("subs %s, #%d", reg, -imm)
+		return
+	}
+	if reg == "r1" {
+		// The literal load would overwrite the value in r1.
+		e.li("r2", uint64(uint32(int32(imm))))
+		e.line("adds %s, r2", reg)
+		return
+	}
+	e.li("r1", uint64(uint32(int32(imm))))
+	e.line("adds %s, r1", reg)
 }
 
 func (e *arm) addrOf(off int, reg string) {
@@ -779,10 +810,22 @@ func (e *arm) emitInst(in *Inst) error {
 }
 
 func (e *arm) emitGEP(in *Inst) error {
-	if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+	base, err := e.loadValTo(in.Ops[0], "r0")
+	if err != nil {
 		return err
 	}
+	curReg := base
 	cur := in.Ty
+	addConst := func(off int) {
+		if off == 0 {
+			return
+		}
+		if curReg != "r0" {
+			e.line("movs r0, %s", curReg)
+			curReg = "r0"
+		}
+		e.addImm("r0", off)
+	}
 	for i := 1; i < len(in.Ops); i++ {
 		idx := in.Ops[i]
 		var scale int
@@ -800,29 +843,43 @@ func (e *arm) emitGEP(in *Inst) error {
 				off = align(off, cur.Fields[j].Align()) + cur.Fields[j].Size()
 			}
 			cur = cur.Fields[int(idx.I)]
-			e.li("r1", uint64(off))
-			e.line("adds r0, r0, r1")
+			addConst(off)
 			continue
 		} else {
 			scale = 1
 		}
-		if idx.Kind == VInt {
-			e.li("r1", uint64(int(idx.I)*scale))
-			e.line("adds r0, r0, r1")
-		} else {
-			if err := e.loadVal(idx, "r1"); err != nil {
-				return err
-			}
-			if scale != 1 {
-				e.line("movs r2, r1")
-				e.li("r1", uint64(scale))
-				e.line("muls r2, r1")
-				e.line("movs r1, r2")
-			}
-			e.line("adds r0, r0, r1")
+		if scale <= 0 {
+			scale = 1
 		}
+		if idx.Kind == VInt {
+			addConst(int(idx.I) * scale)
+			continue
+		}
+		idxReg, err := e.loadValTo(idx, "r1")
+		if err != nil {
+			return err
+		}
+		if scale == 1 {
+			e.line("adds r0, %s, %s", curReg, idxReg)
+		} else {
+			if scale&(scale-1) == 0 {
+				k := 0
+				for s := scale; s > 1; s >>= 1 {
+					k++
+				}
+				e.line("lsls r1, %s, #%d", idxReg, k)
+			} else {
+				if idxReg != "r1" {
+					e.line("movs r1, %s", idxReg)
+				}
+				e.li("r2", uint64(scale))
+				e.line("muls r1, r2")
+			}
+			e.line("adds r0, %s, r1", curReg)
+		}
+		curReg = "r0"
 	}
-	return e.storeDst(in.Dst, "r0")
+	return e.storeDst(in.Dst, curReg)
 }
 
 func (e *arm) emitBin(in *Inst) error {
