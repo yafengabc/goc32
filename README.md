@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 165,804 | 87,630 | 1.89x |
-| LZ4TOS total | 107,877 | 66,850 | 1.61x |
+| raw ELF total | 161,260 | 87,630 | 1.84x |
+| LZ4TOS total | 107,867 | 66,850 | 1.61x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,688 / 1,234 | 998 / 724 |
-| `hello_printf` | 3,316 / 2,155 | 1,606 / 1,202 |
-| `reloc` | 2,232 / 1,569 | 1,142 / 856 |
-| `wheap` | 4,296 / 2,815 | 1,974 / 1,550 |
-| `sh` | 27,748 / 16,193 | 16,054 / 12,589 |
+| `hello` | 1,688 / 1,226 | 998 / 724 |
+| `hello_printf` | 3,220 / 2,152 | 1,606 / 1,202 |
+| `reloc` | 2,200 / 1,558 | 1,142 / 856 |
+| `wheap` | 4,136 / 2,818 | 1,974 / 1,550 |
+| `sh` | 27,044 / 16,220 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -131,7 +131,8 @@ after the peephole were:
 - dead pure SSA computations are removed before code generation;
 - the RV32 peephole forwards loads, deletes dead stores, sinks small constants
   into ALU instructions, turns multiply/divide by a power of two into shifts,
-  rewrites `li 0 + sw` as `sw zero`, and drops jumps to the following label;
+  rewrites `li 0 + sw` as `sw zero`, drops jumps to the following label, and
+  inverts a `bnez/beqz` + `j` pair when the branch target is the fallthrough;
 - small functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
 

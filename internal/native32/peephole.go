@@ -212,7 +212,7 @@ func peepholeRV32Func(lines []string) []string {
 		}
 		res = append(res, line)
 	}
-	return rv32DropJumps(rv32ZeroStores(rv32FoldImmediates(rv32FoldCopies(res))))
+	return rv32DropJumps(rv32InvertBranches(rv32ZeroStores(rv32FoldImmediates(rv32FoldCopies(res)))))
 }
 
 // rv32FoldImmediates sinks a small constant into the ALU instruction that
@@ -411,6 +411,66 @@ func rv32LiZero(line string) (string, bool) {
 		return "", false
 	}
 	return reg, strings.TrimSpace(parts[1]) == "0"
+}
+
+// rv32DropJumps removes a jump whose target is the very next label.  The
+// emitter lays blocks out in order, so roughly half of its branch tails end
+// with such a jump.
+// rv32InvertBranches turns
+//
+//	bnez r, L1
+//	j    L2
+//
+// L1:
+//
+// into `beqz r, L2`, dropping the jump.  Conditional branches have a smaller
+// range than `j`, so only nearby targets are inverted; large functions keep
+// the long jump.
+func rv32InvertBranches(lines []string) []string {
+	labelPos := map[string]int{}
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "\t") {
+			s := strings.TrimSpace(line)
+			if strings.HasSuffix(s, ":") {
+				labelPos[strings.TrimSuffix(s, ":")] = i
+			}
+		}
+	}
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		body, _, ok := rv32Body(lines[i])
+		if ok && (strings.HasPrefix(body, "bnez ") || strings.HasPrefix(body, "beqz ")) && i+2 < len(lines) {
+			f := strings.Fields(body)
+			if len(f) == 3 {
+				cond := strings.TrimSuffix(f[1], ",")
+				l1 := f[2]
+				next, _, ok2 := rv32Body(lines[i+1])
+				if ok2 && strings.HasPrefix(next, "j ") {
+					l2 := strings.TrimSpace(strings.TrimPrefix(next, "j "))
+					if strings.TrimSpace(lines[i+2]) == l1+":" {
+						if pos, ok3 := labelPos[l2]; ok3 && absInt(pos-i) <= 300 {
+							inv := "beqz"
+							if f[0] == "beqz" {
+								inv = "bnez"
+							}
+							out = append(out, "\t"+inv+" "+cond+", "+l2)
+							i++ // drop the jump
+							continue
+						}
+					}
+				}
+			}
+		}
+		out = append(out, lines[i])
+	}
+	return out
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // rv32DropJumps removes a jump whose target is the very next label.  The
