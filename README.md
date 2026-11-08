@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 154,572 | 87,630 | 1.76x |
-| LZ4TOS total | 104,649 | 66,850 | 1.57x |
+| raw ELF total | 144,940 | 87,630 | 1.65x |
+| LZ4TOS total | 99,614 | 66,850 | 1.49x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,656 / 1,219 | 998 / 724 |
-| `hello_printf` | 3,124 / 2,108 | 1,606 / 1,202 |
-| `reloc` | 2,168 / 1,542 | 1,142 / 856 |
-| `wheap` | 4,040 / 2,770 | 1,974 / 1,550 |
-| `sh` | 24,996 / 15,621 | 16,054 / 12,589 |
+| `hello` | 1,592 / 1,151 | 998 / 724 |
+| `hello_printf` | 2,964 / 1,992 | 1,606 / 1,202 |
+| `reloc` | 2,072 / 1,469 | 1,142 / 856 |
+| `wheap` | 3,816 / 2,634 | 1,974 / 1,550 |
+| `sh` | 23,460 / 15,116 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -134,7 +134,13 @@ after the peephole were:
   taking the stack round trip, and memory stores use an already-live value or
   pointer register directly;
 - dead pure SSA computations are removed before code generation, as are loads
-  from non-escaping locals (a stack load cannot fault);
+  from non-escaping locals (a stack load cannot fault), and an unread local is
+  dropped together with its stores;
+- RV32 computes through `q0`/`q1` pseudo-temporaries that become `a4`/`a5`
+  after the peephole.  Both are in `x8-x15`, so the assembler can use the
+  compressed `c.*` forms; the peephole canonicalises the alias, so cached
+  values are killed when the same physical register is written as a call
+  argument;
 - no-op casts (`ptrtoint`/`inttoptr`, same-width `bitcast`/`trunc`/`zext`/`sext`)
   are replaced by their operand, which removes the copy gocl emits for every
   pointer passed through TinyOS's i32 ABI;
@@ -175,8 +181,8 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 36,392 bytes / 23,175 compressed on the
-Cortex-M3 target and 46,444 / 25,580 for the RP2040, down from 72 KB / 84 KB
+literal pools.  ARM `sh` is now 36,008 bytes / 22,909 compressed on the
+Cortex-M3 target and 45,788 / 25,091 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB

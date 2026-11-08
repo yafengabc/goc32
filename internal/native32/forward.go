@@ -176,6 +176,8 @@ func forwardLoadsFunc(f *Func, regVars, minCount int) {
 		}
 	}
 	if len(subst) == 0 {
+		dceFunc(f)
+		dropDeadAllocas(f)
 		return
 	}
 	resolve := func(v Value) Value {
@@ -211,4 +213,47 @@ func forwardLoadsFunc(f *Func, regVars, minCount int) {
 	// instructions, so clean up immediately rather than waiting for a pass
 	// that runs before this one.
 	dceFunc(f)
+	dropDeadAllocas(f)
+}
+
+// dropDeadAllocas removes a non-escaping local that is never read.  Its
+// address cannot appear anywhere except the pointer operand of a store, so
+// once forwarding has removed every load, the cell and its stores are dead.
+func dropDeadAllocas(f *Func) {
+	direct := findDirectAllocas(f)
+	if len(direct) == 0 {
+		return
+	}
+	loads := map[string]int{}
+	for _, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			if in.Op == "load" && len(in.Ops) == 1 &&
+				in.Ops[0].Kind == VLocal && direct[in.Ops[0].Name] {
+				loads[in.Ops[0].Name]++
+			}
+		}
+	}
+	dead := map[string]bool{}
+	for name := range direct {
+		if loads[name] == 0 {
+			dead[name] = true
+		}
+	}
+	if len(dead) == 0 {
+		return
+	}
+	for _, blk := range f.Blocks {
+		kept := blk.Insts[:0]
+		for _, in := range blk.Insts {
+			if in.Op == "alloca" && dead[in.Dst] {
+				continue
+			}
+			if in.Op == "store" && len(in.Ops) == 2 &&
+				in.Ops[1].Kind == VLocal && dead[in.Ops[1].Name] {
+				continue
+			}
+			kept = append(kept, in)
+		}
+		blk.Insts = kept
+	}
 }

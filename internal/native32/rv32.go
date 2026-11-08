@@ -2,7 +2,7 @@ package native32
 
 // rv32.go emits RV32IM assembly (GNU syntax, assembler = clang/llvm-mc) from
 // the parsed IR. It is deliberately a stack machine: every SSA value gets a
-// frame slot, expressions are computed through t0/t1, and no register
+// frame slot, expressions are computed through q0/q1, and no register
 // allocation is attempted. That is slow but easy to verify, and it is the
 // first milestone before an internal assembler/linker exists.
 
@@ -57,7 +57,7 @@ func EmitRV32(m *Module) (string, error) {
 		}
 	}
 	e.b.WriteString("\t.section .note.GNU-stack,\"\",@progbits\n")
-	return peepholeRV32(e.b.String()), nil
+	return rv32RenameScratch(peepholeRV32(e.b.String())), nil
 }
 
 func (e *rv32) line(f string, a ...interface{}) {
@@ -322,8 +322,8 @@ func (e *rv32) emitFunc(f *Func) error {
 				if ri < 8 {
 					src = fmt.Sprintf("a%d", ri)
 				} else {
-					e.loadSlot(e.frame+(ri-8)*4, "t0")
-					src = "t0"
+					e.loadSlot(e.frame+(ri-8)*4, "q0")
+					src = "q0"
 				}
 				if reg := e.regVar[target]; reg != "" {
 					e.line("mv %s, %s", reg, src)
@@ -337,8 +337,8 @@ func (e *rv32) emitFunc(f *Func) error {
 				if ri < 8 {
 					e.line("mv %s, a%d", reg, ri)
 				} else {
-					e.loadSlot(e.frame+(ri-8)*4, "t0")
-					e.line("mv %s, t0", reg)
+					e.loadSlot(e.frame+(ri-8)*4, "q0")
+					e.line("mv %s, q0", reg)
 				}
 				ri++
 				continue
@@ -346,8 +346,8 @@ func (e *rv32) emitFunc(f *Func) error {
 			if ri < 8 {
 				e.storeSlot(off+w*4, fmt.Sprintf("a%d", ri))
 			} else {
-				e.loadSlot(e.frame+(ri-8)*4, "t0")
-				e.storeSlot(off+w*4, "t0")
+				e.loadSlot(e.frame+(ri-8)*4, "q0")
+				e.storeSlot(off+w*4, "q0")
 			}
 			ri++
 		}
@@ -407,7 +407,7 @@ func (e *rv32) slot(name string) int { return e.slots[name] }
 // loadSlot/storeSlot handle frame offsets beyond the 12-bit signed immediate
 // of lw/sw. Deep or unoptimised functions easily exceed 2 KiB of slots.
 // t5/t6 are not used by the instruction emitter itself, so they are safe
-// temporaries even while t0..t4 hold a live 64-bit value.
+// temporaries even while q0..t4 hold a live 64-bit value.
 func (e *rv32) loadSlot(off int, reg string) {
 	if off >= -2048 && off <= 2047 {
 		e.line("lw %s, %d(sp)", reg, off)
@@ -514,8 +514,8 @@ func (e *rv32) adjustSP(n int) {
 	// li carries the sign, so a single add is enough. Subtracting the
 	// immediate as well (as this did) turned a negative frame into an
 	// upward move and every >2 KiB frame wrote above the task window.
-	e.line("li t0, %d", n)
-	e.line("add sp, sp, t0")
+	e.line("li q0, %d", n)
+	e.line("add sp, sp, q0")
 }
 
 func (e *rv32) addImm(reg string, imm int) {
@@ -637,8 +637,8 @@ func (e *rv32) emitInst(in *Inst) error {
 			return nil
 		}
 		off := e.allocas[in.Dst]
-		e.addrSp(off, "t0")
-		return e.storeDst(in.Dst, "t0")
+		e.addrSp(off, "q0")
+		return e.storeDst(in.Dst, "q0")
 	case "load":
 		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
 			off := e.allocas[v.Name]
@@ -648,47 +648,47 @@ func (e *rv32) emitInst(in *Inst) error {
 					e.aliasVar[in.Dst] = v.Name
 					return nil
 				}
-				e.line("mv t1, %s", reg)
+				e.line("mv q1, %s", reg)
 			} else if in.Ty.Size() == 8 {
-				e.loadSlot(off, "t1")
+				e.loadSlot(off, "q1")
 				e.loadSlot(off+4, "t2")
 				dst := e.slots[in.Dst]
-				e.storeSlot(dst, "t1")
+				e.storeSlot(dst, "q1")
 				e.storeSlot(dst+4, "t2")
 				return nil
 			} else {
-				e.loadSized(off, in.Ty.Size(), "t1")
+				e.loadSized(off, in.Ty.Size(), "q1")
 			}
-			return e.storeDst(in.Dst, "t1")
+			return e.storeDst(in.Dst, "q1")
 		}
-		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+		if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 			return err
 		}
 		sz := in.Ty.Size()
 		switch sz {
 		case 1:
-			e.line("lbu t1, 0(t0)")
+			e.line("lbu q1, 0(q0)")
 		case 2:
-			e.line("lhu t1, 0(t0)")
+			e.line("lhu q1, 0(q0)")
 		case 4:
-			e.line("lw t1, 0(t0)")
+			e.line("lw q1, 0(q0)")
 		case 8:
-			e.line("lw t1, 0(t0)")
-			e.line("lw t2, 4(t0)")
+			e.line("lw q1, 0(q0)")
+			e.line("lw t2, 4(q0)")
 			off := e.slots[in.Dst]
-			e.storeSlot(off, "t1")
+			e.storeSlot(off, "q1")
 			e.storeSlot(off+4, "t2")
 			return nil
 		default:
 			// Aggregate load: copy bytes into the destination slot.
 			off := e.slots[in.Dst]
 			for i := 0; i < sz; i += 4 {
-				e.line("lw t1, %d(t0)", i)
-				e.storeSlot(off+i, "t1")
+				e.line("lw q1, %d(q0)", i)
+				e.storeSlot(off+i, "q1")
 			}
 			return nil
 		}
-		return e.storeDst(in.Dst, "t1")
+		return e.storeDst(in.Dst, "q1")
 	case "store":
 		if e.skipInst[in] {
 			return nil
@@ -704,15 +704,15 @@ func (e *rv32) emitInst(in *Inst) error {
 						continue
 					}
 					if e.lastUse[name] > e.instIdx {
-						e.line("mv t1, %s", reg)
-						if err := e.storeDst(name, "t1"); err != nil {
+						e.line("mv q1, %s", reg)
+						if err := e.storeDst(name, "q1"); err != nil {
 							return err
 						}
 					}
 					delete(e.regAlias, name)
 					delete(e.aliasVar, name)
 				}
-				src, err := e.loadValTo(in.Ops[0], "t0")
+				src, err := e.loadValTo(in.Ops[0], "q0")
 				if err != nil {
 					return err
 				}
@@ -722,15 +722,15 @@ func (e *rv32) emitInst(in *Inst) error {
 				return nil
 			}
 			if sz == 8 {
-				if err := e.loadPair(in.Ops[0], "t0", "t1"); err != nil {
+				if err := e.loadPair(in.Ops[0], "q0", "q1"); err != nil {
 					return err
 				}
 				off := e.allocas[v.Name]
-				e.storeSlot(off, "t0")
-				e.storeSlot(off+4, "t1")
+				e.storeSlot(off, "q0")
+				e.storeSlot(off+4, "q1")
 				return nil
 			}
-			src, err := e.loadValTo(in.Ops[0], "t0")
+			src, err := e.loadValTo(in.Ops[0], "q0")
 			if err != nil {
 				return err
 			}
@@ -739,11 +739,11 @@ func (e *rv32) emitInst(in *Inst) error {
 		}
 		sz := in.Ty.Size()
 		if sz == 1 || sz == 2 || sz == 4 {
-			val, err := e.loadValTo(in.Ops[0], "t0")
+			val, err := e.loadValTo(in.Ops[0], "q0")
 			if err != nil {
 				return err
 			}
-			ptr, err := e.loadValTo(in.Ops[1], "t1")
+			ptr, err := e.loadValTo(in.Ops[1], "q1")
 			if err != nil {
 				return err
 			}
@@ -751,17 +751,17 @@ func (e *rv32) emitInst(in *Inst) error {
 			e.line("%s %s, 0(%s)", op, val, ptr)
 			return nil
 		}
-		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+		if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 			return err
 		}
-		if err := e.loadVal(in.Ops[1], "t1"); err != nil {
+		if err := e.loadVal(in.Ops[1], "q1"); err != nil {
 			return err
 		}
 		switch sz {
 		case 8:
 			e.loadSlot(e.slots[in.Ops[0].Name]+4, "t2")
-			e.line("sw t0, 0(t1)")
-			e.line("sw t2, 4(t1)")
+			e.line("sw q0, 0(q1)")
+			e.line("sw t2, 4(q1)")
 		default:
 			off := 0
 			if in.Ops[0].Kind == VLocal {
@@ -769,7 +769,7 @@ func (e *rv32) emitInst(in *Inst) error {
 			}
 			for i := 0; i < sz; i += 4 {
 				e.loadSlot(off+i, "t2")
-				e.line("sw t2, %d(t1)", i)
+				e.line("sw t2, %d(q1)", i)
 			}
 		}
 		return nil
@@ -813,7 +813,7 @@ func (e *rv32) emitInst(in *Inst) error {
 }
 
 func (e *rv32) emitGEP(in *Inst) error {
-	base, err := e.loadValTo(in.Ops[0], "t0")
+	base, err := e.loadValTo(in.Ops[0], "q0")
 	if err != nil {
 		return err
 	}
@@ -823,17 +823,17 @@ func (e *rv32) emitGEP(in *Inst) error {
 		if off == 0 {
 			return
 		}
-		if curReg == "t0" {
-			e.addImm("t0", off)
+		if curReg == "q0" {
+			e.addImm("q0", off)
 			return
 		}
 		if off >= -2048 && off <= 2047 {
-			e.line("addi t0, %s, %d", curReg, off)
+			e.line("addi q0, %s, %d", curReg, off)
 		} else {
 			e.line("li t5, %d", off)
-			e.line("add t0, %s, t5", curReg)
+			e.line("add q0, %s, t5", curReg)
 		}
-		curReg = "t0"
+		curReg = "q0"
 	}
 	for i := 1; i < len(in.Ops); i++ {
 		idx := in.Ops[i]
@@ -862,26 +862,26 @@ func (e *rv32) emitGEP(in *Inst) error {
 			addConst(int(idx.I) * scale)
 			continue
 		}
-		idxReg, err := e.loadValTo(idx, "t1")
+		idxReg, err := e.loadValTo(idx, "q1")
 		if err != nil {
 			return err
 		}
 		if scale == 1 {
-			e.line("add t0, %s, %s", curReg, idxReg)
+			e.line("add q0, %s, %s", curReg, idxReg)
 		} else {
 			if scale&(scale-1) == 0 {
 				k := 0
 				for s := scale; s > 1; s >>= 1 {
 					k++
 				}
-				e.line("slli t1, %s, %d", idxReg, k)
+				e.line("slli q1, %s, %d", idxReg, k)
 			} else {
 				e.line("li t2, %d", scale)
-				e.line("mul t1, %s, t2", idxReg)
+				e.line("mul q1, %s, t2", idxReg)
 			}
-			e.line("add t0, %s, t1", curReg)
+			e.line("add q0, %s, q1", curReg)
 		}
-		curReg = "t0"
+		curReg = "q0"
 	}
 	return e.storeDst(in.Dst, curReg)
 }
@@ -891,11 +891,11 @@ func (e *rv32) emitBin(in *Inst) error {
 	if wide {
 		return e.emitBin64(in)
 	}
-	r0, err := e.loadValTo(in.Ops[0], "t0")
+	r0, err := e.loadValTo(in.Ops[0], "q0")
 	if err != nil {
 		return err
 	}
-	r1, err := e.loadValTo(in.Ops[1], "t1")
+	r1, err := e.loadValTo(in.Ops[1], "q1")
 	if err != nil {
 		return err
 	}
@@ -908,92 +908,92 @@ func (e *rv32) emitBin(in *Inst) error {
 	if op == "" {
 		return fmt.Errorf("unsupported binop %s", in.Op)
 	}
-	e.line("%s t0, %s, %s", op, r0, r1)
-	return e.storeDst(in.Dst, "t0")
+	e.line("%s q0, %s, %s", op, r0, r1)
+	return e.storeDst(in.Dst, "q0")
 }
 
 func (e *rv32) emitBin64(in *Inst) error {
 	offa, offb, offd := e.slots[in.Ops[0].Name], e.slots[in.Ops[1].Name], e.slots[in.Dst]
 	if in.Ops[0].Kind != VLocal || in.Ops[1].Kind != VLocal {
 		// Constants/globals in 64-bit arithmetic: materialise low words.
-		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+		if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 			return err
 		}
-		e.storeSlot(offd, "t0")
+		e.storeSlot(offd, "q0")
 		e.storeSlot(offd+4, "zero")
-		if err := e.loadVal(in.Ops[1], "t1"); err != nil {
+		if err := e.loadVal(in.Ops[1], "q1"); err != nil {
 			return err
 		}
 		switch in.Op {
 		case "add":
-			e.line("add t0, t0, t1")
-			e.storeSlot(offd, "t0")
+			e.line("add q0, q0, q1")
+			e.storeSlot(offd, "q0")
 		case "mul":
-			e.line("mul t0, t0, t1")
-			e.storeSlot(offd, "t0")
+			e.line("mul q0, q0, q1")
+			e.storeSlot(offd, "q0")
 		case "and":
-			e.line("and t0, t0, t1")
-			e.storeSlot(offd, "t0")
+			e.line("and q0, q0, q1")
+			e.storeSlot(offd, "q0")
 		case "or":
-			e.line("or t0, t0, t1")
-			e.storeSlot(offd, "t0")
+			e.line("or q0, q0, q1")
+			e.storeSlot(offd, "q0")
 		case "xor":
-			e.line("xor t0, t0, t1")
-			e.storeSlot(offd, "t0")
+			e.line("xor q0, q0, q1")
+			e.storeSlot(offd, "q0")
 		case "shl", "lshr", "ashr":
-			if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+			if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 				return err
 			}
 			switch in.Op {
 			case "shl":
-				e.line("sll t0, t0, t1")
+				e.line("sll q0, q0, q1")
 			case "lshr":
-				e.line("srl t0, t0, t1")
+				e.line("srl q0, q0, q1")
 			case "ashr":
-				e.line("sra t0, t0, t1")
+				e.line("sra q0, q0, q1")
 			}
-			e.storeSlot(offd, "t0")
+			e.storeSlot(offd, "q0")
 		}
 		return nil
 	}
-	e.loadSlot(offa, "t0")
+	e.loadSlot(offa, "q0")
 	e.loadSlot(offa+4, "t2")
-	e.loadSlot(offb, "t1")
+	e.loadSlot(offb, "q1")
 	e.loadSlot(offb+4, "t3")
 	switch in.Op {
 	case "add":
-		e.line("add t0, t0, t1")
-		e.line("sltu t4, t0, t1")
+		e.line("add q0, q0, q1")
+		e.line("sltu t4, q0, q1")
 		e.line("add t2, t2, t3")
 		e.line("add t2, t2, t4")
 	case "sub":
-		e.line("sub t0, t0, t1")
-		e.line("sltu t4, t0, t1")
+		e.line("sub q0, q0, q1")
+		e.line("sltu t4, q0, q1")
 		e.line("sub t2, t2, t3")
 		e.line("sub t2, t2, t4")
 	case "mul":
-		e.line("mul t0, t0, t1")
+		e.line("mul q0, q0, q1")
 		e.line("li t2, 0")
 	case "and":
-		e.line("and t0, t0, t1")
+		e.line("and q0, q0, q1")
 		e.line("and t2, t2, t3")
 	case "or":
-		e.line("or t0, t0, t1")
+		e.line("or q0, q0, q1")
 		e.line("or t2, t2, t3")
 	case "xor":
-		e.line("xor t0, t0, t1")
+		e.line("xor q0, q0, q1")
 		e.line("xor t2, t2, t3")
 	case "shl":
 		// Only the low 32 bits matter for our address arithmetic.
-		e.line("sll t0, t0, t1")
+		e.line("sll q0, q0, q1")
 		e.line("li t2, 0")
 	case "lshr", "ashr":
-		e.line("srl t0, t0, t1")
+		e.line("srl q0, q0, q1")
 		e.line("li t2, 0")
 	default:
 		return fmt.Errorf("unsupported 64-bit op %s", in.Op)
 	}
-	e.storeSlot(offd, "t0")
+	e.storeSlot(offd, "q0")
 	e.storeSlot(offd+4, "t2")
 	return nil
 }
@@ -1003,63 +1003,63 @@ func (e *rv32) emitICmp(in *Inst) error {
 	if wide {
 		return e.emitICmp64(in)
 	}
-	r0, err := e.loadValTo(in.Ops[0], "t0")
+	r0, err := e.loadValTo(in.Ops[0], "q0")
 	if err != nil {
 		return err
 	}
-	r1, err := e.loadValTo(in.Ops[1], "t1")
+	r1, err := e.loadValTo(in.Ops[1], "q1")
 	if err != nil {
 		return err
 	}
 	switch in.Pred {
 	case "eq":
-		e.line("xor t0, %s, %s", r0, r1)
-		e.line("seqz t0, t0")
+		e.line("xor q0, %s, %s", r0, r1)
+		e.line("seqz q0, q0")
 	case "ne":
-		e.line("xor t0, %s, %s", r0, r1)
-		e.line("snez t0, t0")
+		e.line("xor q0, %s, %s", r0, r1)
+		e.line("snez q0, q0")
 	case "slt":
-		e.line("slt t0, %s, %s", r0, r1)
+		e.line("slt q0, %s, %s", r0, r1)
 	case "sgt":
-		e.line("slt t0, %s, %s", r1, r0)
+		e.line("slt q0, %s, %s", r1, r0)
 	case "sle":
-		e.line("slt t0, %s, %s", r1, r0)
-		e.line("xori t0, t0, 1")
+		e.line("slt q0, %s, %s", r1, r0)
+		e.line("xori q0, q0, 1")
 	case "sge":
-		e.line("slt t0, %s, %s", r0, r1)
-		e.line("xori t0, t0, 1")
+		e.line("slt q0, %s, %s", r0, r1)
+		e.line("xori q0, q0, 1")
 	case "ult":
-		e.line("sltu t0, %s, %s", r0, r1)
+		e.line("sltu q0, %s, %s", r0, r1)
 	case "ugt":
-		e.line("sltu t0, %s, %s", r1, r0)
+		e.line("sltu q0, %s, %s", r1, r0)
 	case "ule":
-		e.line("sltu t0, %s, %s", r1, r0)
-		e.line("xori t0, t0, 1")
+		e.line("sltu q0, %s, %s", r1, r0)
+		e.line("xori q0, q0, 1")
 	case "uge":
-		e.line("sltu t0, %s, %s", r0, r1)
-		e.line("xori t0, t0, 1")
+		e.line("sltu q0, %s, %s", r0, r1)
+		e.line("xori q0, q0, 1")
 	default:
 		return fmt.Errorf("unsupported icmp predicate %s", in.Pred)
 	}
-	return e.storeDst(in.Dst, "t0")
+	return e.storeDst(in.Dst, "q0")
 }
 
 func (e *rv32) emitICmp64(in *Inst) error {
-	if err := e.loadPair(in.Ops[0], "t0", "t2"); err != nil {
+	if err := e.loadPair(in.Ops[0], "q0", "t2"); err != nil {
 		return err
 	}
-	if err := e.loadPair(in.Ops[1], "t1", "t3"); err != nil {
+	if err := e.loadPair(in.Ops[1], "q1", "t3"); err != nil {
 		return err
 	}
 	switch in.Pred {
 	case "eq", "ne":
-		e.line("xor t0, t0, t1")
+		e.line("xor q0, q0, q1")
 		e.line("xor t2, t2, t3")
-		e.line("or t0, t0, t2")
+		e.line("or q0, q0, t2")
 		if in.Pred == "eq" {
-			e.line("seqz t0, t0")
+			e.line("seqz q0, q0")
 		} else {
-			e.line("snez t0, t0")
+			e.line("snez q0, q0")
 		}
 	case "slt", "sgt", "sle", "sge", "ult", "ugt", "ule", "uge":
 		// Compare high words, then low words on a tie.
@@ -1070,24 +1070,24 @@ func (e *rv32) emitICmp64(in *Inst) error {
 		}
 		e.line("%s t4, t2, t3", cmp)
 		e.line("bne t2, t3, 1f")
-		e.line("sltu t4, t0, t1")
+		e.line("sltu t4, q0, q1")
 		e.label("1")
 		switch in.Pred {
 		case "slt", "ult":
-			e.line("mv t0, t4")
+			e.line("mv q0, t4")
 		case "sgt", "ugt":
-			e.line("xori t0, t4, 1")
+			e.line("xori q0, t4, 1")
 		case "sle", "ule":
-			e.line("sltu t0, t1, t0")
-			e.line("xori t0, t0, 1")
+			e.line("sltu q0, q1, q0")
+			e.line("xori q0, q0, 1")
 		case "sge", "uge":
-			e.line("sltu t0, t0, t1")
-			e.line("xori t0, t0, 1")
+			e.line("sltu q0, q0, q1")
+			e.line("xori q0, q0, 1")
 		}
 	default:
 		return fmt.Errorf("unsupported 64-bit icmp %s", in.Pred)
 	}
-	return e.storeDst(in.Dst, "t0")
+	return e.storeDst(in.Dst, "q0")
 }
 
 func (e *rv32) emitCast(in *Inst) error {
@@ -1102,63 +1102,63 @@ func (e *rv32) emitCast(in *Inst) error {
 		if srcSz > 4 {
 			// take the low word
 			if src.Kind == VLocal {
-				e.loadSlot(e.slots[src.Name], "t0")
-			} else if err := e.loadVal(src, "t0"); err != nil {
+				e.loadSlot(e.slots[src.Name], "q0")
+			} else if err := e.loadVal(src, "q0"); err != nil {
 				return err
 			}
-		} else if err := e.loadVal(src, "t0"); err != nil {
+		} else if err := e.loadVal(src, "q0"); err != nil {
 			return err
 		}
 		switch dstSz {
 		case 1:
-			e.line("andi t0, t0, 255")
+			e.line("andi q0, q0, 255")
 		case 2:
-			e.line("li t1, 65535")
-			e.line("and t0, t0, t1")
+			e.line("li q1, 65535")
+			e.line("and q0, q0, q1")
 		case 4:
 		}
-		return e.storeDst(in.Dst, "t0")
+		return e.storeDst(in.Dst, "q0")
 	}
 	// zext / sext / bitcast / ptrtoint / inttoptr
-	if err := e.loadVal(src, "t0"); err != nil {
+	if err := e.loadVal(src, "q0"); err != nil {
 		return err
 	}
 	if dstSz > 4 {
 		off := e.slots[in.Dst]
-		e.storeSlot(off, "t0")
+		e.storeSlot(off, "q0")
 		if in.Op == "sext" && srcSz < 4 {
 			sh := uint(32 - srcSz*8)
-			e.line("slli t0, t0, %d", sh)
-			e.line("srai t0, t0, %d", sh)
-			e.storeSlot(off, "t0")
-			e.line("srai t1, t0, 31")
-			e.storeSlot(off+4, "t1")
+			e.line("slli q0, q0, %d", sh)
+			e.line("srai q0, q0, %d", sh)
+			e.storeSlot(off, "q0")
+			e.line("srai q1, q0, 31")
+			e.storeSlot(off+4, "q1")
 		} else {
 			e.storeSlot(off+4, "zero")
 		}
 		return nil
 	}
-	return e.storeDst(in.Dst, "t0")
+	return e.storeDst(in.Dst, "q0")
 }
 
 func (e *rv32) emitSelect(in *Inst) error {
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 		return err
 	}
 	fl, tl := e.newLabel(), e.newLabel()
 	done := e.newLabel()
-	e.line("bnez t0, %s", tl)
+	e.line("bnez q0, %s", tl)
 	e.label(fl)
-	if err := e.loadVal(in.Ops[2], "t0"); err != nil {
+	if err := e.loadVal(in.Ops[2], "q0"); err != nil {
 		return err
 	}
 	e.line("j %s", done)
 	e.label(tl)
-	if err := e.loadVal(in.Ops[1], "t0"); err != nil {
+	if err := e.loadVal(in.Ops[1], "q0"); err != nil {
 		return err
 	}
 	e.label(done)
-	return e.storeDst(in.Dst, "t0")
+	return e.storeDst(in.Dst, "q0")
 }
 
 var labelSeq int
@@ -1176,7 +1176,7 @@ func (e *rv32) emitBr(in *Inst) error {
 		e.line("j %s", blockLabel(e.fn, in.Labels[0]))
 		return nil
 	}
-	cond, err := e.loadValTo(in.Ops[0], "t0")
+	cond, err := e.loadValTo(in.Ops[0], "q0")
 	if err != nil {
 		return err
 	}
@@ -1197,13 +1197,13 @@ func (e *rv32) emitBr(in *Inst) error {
 }
 
 func (e *rv32) emitSwitch(in *Inst) error {
-	cond, err := e.loadValTo(in.Ops[0], "t0")
+	cond, err := e.loadValTo(in.Ops[0], "q0")
 	if err != nil {
 		return err
 	}
 	for _, c := range in.Cases {
-		e.line("li t1, %d", c.Val.I)
-		e.line("beq %s, t1, %s", cond, blockLabel(e.fn, c.Dest))
+		e.line("li q1, %d", c.Val.I)
+		e.line("beq %s, q1, %s", cond, blockLabel(e.fn, c.Dest))
 	}
 	if err := e.emitPhiCopies(in.Labels[0], e.curBlockName()); err != nil {
 		return err
@@ -1252,14 +1252,14 @@ func (e *rv32) emitPhiCopies(dest, pred string) error {
 		if idx < 0 {
 			continue
 		}
-		if err := e.loadVal(in.Ops[idx], "t0"); err != nil {
+		if err := e.loadVal(in.Ops[idx], "q0"); err != nil {
 			return err
 		}
-		e.storeSlot(e.phiTmp[in.Dst], "t0")
+		e.storeSlot(e.phiTmp[in.Dst], "q0")
 	}
 	for _, in := range phis {
-		e.loadSlot(e.phiTmp[in.Dst], "t0")
-		e.storeSlot(e.slots[in.Dst], "t0")
+		e.loadSlot(e.phiTmp[in.Dst], "q0")
+		e.storeSlot(e.slots[in.Dst], "q0")
 	}
 	return nil
 }
@@ -1299,16 +1299,16 @@ func (e *rv32) emitCall(in *Inst) error {
 		}
 		ty := in.OpTys[i]
 		if ty.Size() > 4 {
-			if err := e.loadPair(v, "t0", "t1"); err != nil {
+			if err := e.loadPair(v, "q0", "q1"); err != nil {
 				return err
 			}
-			e.storeSlotKeep(p.word*4, "t0")
-			e.storeSlotKeep(p.word*4+4, "t1")
+			e.storeSlotKeep(p.word*4, "q0")
+			e.storeSlotKeep(p.word*4+4, "q1")
 		} else {
-			if err := e.loadVal(v, "t0"); err != nil {
+			if err := e.loadVal(v, "q0"); err != nil {
 				return err
 			}
-			e.storeSlotKeep(p.word*4, "t0")
+			e.storeSlotKeep(p.word*4, "q0")
 		}
 	}
 	// Load register arguments.
@@ -1327,10 +1327,12 @@ func (e *rv32) emitCall(in *Inst) error {
 		}
 	}
 	if in.Indirect {
-		if err := e.loadVal(Value{Kind: VLocal, Name: in.Callee}, "t0"); err != nil {
+		// a4/a5 may be argument 4/5 here (q0/q1 are those physical
+		// registers), so use a plain temporary for the call target.
+		if err := e.loadVal(Value{Kind: VLocal, Name: in.Callee}, "t2"); err != nil {
 			return err
 		}
-		e.line("jalr ra, t0, 0")
+		e.line("jalr ra, t2, 0")
 	} else {
 		e.line("call %s", name)
 	}
@@ -1390,27 +1392,27 @@ func (e *rv32) emitIntrinsic(in *Inst) error {
 		// The argument is the address of the va_list object. It points at
 		// the first variadic slot: the register save area at the top of the
 		// frame, or the caller's stack arguments immediately above it.
-		if err := e.loadVal(in.Ops[0], "t1"); err != nil {
+		if err := e.loadVal(in.Ops[0], "q1"); err != nil {
 			return err
 		}
 		if e.nFixed < 8 {
-			e.addrSp(e.saveOff+e.nFixed*4, "t0")
+			e.addrSp(e.saveOff+e.nFixed*4, "q0")
 		} else {
-			e.addrSp(e.frame+(e.nFixed-8)*4, "t0")
+			e.addrSp(e.frame+(e.nFixed-8)*4, "q0")
 		}
-		e.line("sw t0, 0(t1)")
+		e.line("sw q0, 0(q1)")
 		return nil
 	case strings.HasPrefix(in.Callee, "llvm.va_end"):
 		return nil
 	case strings.HasPrefix(in.Callee, "llvm.va_copy"):
-		if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+		if err := e.loadVal(in.Ops[0], "q0"); err != nil {
 			return err
 		}
-		if err := e.loadVal(in.Ops[1], "t1"); err != nil {
+		if err := e.loadVal(in.Ops[1], "q1"); err != nil {
 			return err
 		}
-		e.line("lw t2, 0(t1)")
-		e.line("sw t2, 0(t0)")
+		e.line("lw t2, 0(q1)")
+		e.line("sw t2, 0(q0)")
 		return nil
 	case strings.HasPrefix(in.Callee, "llvm.memcpy"), strings.HasPrefix(in.Callee, "llvm.memmove"):
 		if len(in.Ops) < 3 {
@@ -1445,8 +1447,8 @@ func (e *rv32) emitIntrinsic(in *Inst) error {
 	}
 	// Unknown intrinsic: return zero.
 	if in.Dst != "" {
-		e.line("li t0, 0")
-		return e.storeDst(in.Dst, "t0")
+		e.line("li q0, 0")
+		return e.storeDst(in.Dst, "q0")
 	}
 	return nil
 }

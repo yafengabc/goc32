@@ -84,6 +84,34 @@ func TestForwardDirectLoads(t *testing.T) {
 	}
 }
 
+func TestDropDeadAlloca(t *testing.T) {
+	iw := &Type{Kind: KInt, Bits: 32}
+	f := &Func{Blocks: []*Block{{Label: "entry"}}}
+	add := func(in *Inst) { f.Blocks[0].Insts = append(f.Blocks[0].Insts, in) }
+	add(&Inst{Op: "alloca", Dst: "dead", Ty: iw})
+	add(&Inst{Op: "alloca", Dst: "esc", Ty: iw})
+	add(&Inst{Op: "store", Ty: iw,
+		Ops: []Value{{Kind: VLocal, Name: "v"}, {Kind: VLocal, Name: "dead"}}})
+	add(&Inst{Op: "getelementptr", Dst: "g", Ty: iw,
+		Ops: []Value{{Kind: VLocal, Name: "esc"}}})
+	add(&Inst{Op: "store", Ty: iw,
+		Ops: []Value{{Kind: VLocal, Name: "g"}, {Kind: VGlobal, Name: "G"}}})
+	add(&Inst{Op: "store", Ty: iw,
+		Ops: []Value{{Kind: VLocal, Name: "v"}, {Kind: VLocal, Name: "esc"}}})
+
+	forwardLoadsFunc(f, 0, 3)
+
+	for _, in := range f.Blocks[0].Insts {
+		if in.Op == "alloca" && in.Dst == "dead" {
+			t.Fatal("unread alloca kept")
+		}
+		if in.Op == "alloca" && in.Dst == "esc" {
+			return
+		}
+	}
+	t.Fatal("escaping alloca removed")
+}
+
 func TestForwardCrossBlockConflict(t *testing.T) {
 	iw := &Type{Kind: KInt, Bits: 32}
 	f := &Func{Blocks: []*Block{

@@ -25,7 +25,7 @@ var (
 	rv32LwSp     = regexp.MustCompile(`^lw\s+([a-z0-9]+),\s*(-?\d+)\(sp\)$`)
 	rv32SwSp     = regexp.MustCompile(`^sw\s+([a-z0-9]+),\s*(-?\d+)\(sp\)$`)
 	rv32ZeroAddi = regexp.MustCompile(`^addi\s+([a-z0-9]+),\s*([a-z0-9]+),\s*0$`)
-	rv32Reg      = regexp.MustCompile(`^(x\d+|zero|ra|sp|gp|tp|t[0-6]|s\d+|a[0-7])$`)
+	rv32Reg      = regexp.MustCompile(`^(x\d+|zero|ra|sp|gp|tp|t[0-6]|q[01]|s\d+|a[0-7])$`)
 )
 
 // Instructions whose first operand is not a destination.
@@ -119,12 +119,18 @@ func peepholeRV32Func(lines []string) []string {
 	kill := func(reg string) {
 		// A register can be the cached value of more than one slot (the same
 		// value stored twice), so drop every entry, not just regSlot[reg].
+		// q0/q1 are assembler pseudo-names for a4/a5: the program itself also
+		// writes those registers (call arguments), so identity is canonical.
 		for off, q := range slotReg {
-			if q == reg {
+			if sameReg(q, reg) {
 				delete(slotReg, off)
 			}
 		}
-		delete(regSlot, reg)
+		for r := range regSlot {
+			if sameReg(r, reg) {
+				delete(regSlot, r)
+			}
+		}
 	}
 
 	for _, line := range lines {
@@ -161,7 +167,7 @@ func peepholeRV32Func(lines []string) []string {
 		if m := rv32LwSp.FindStringSubmatch(body); m != nil {
 			reg := m[1]
 			off, _ := strconv.Atoi(m[2])
-			if q, ok := slotReg[off]; ok && q == reg {
+			if q, ok := slotReg[off]; ok && sameReg(q, reg) {
 				// Already in the destination: drop the load.
 				continue
 			}
@@ -525,7 +531,42 @@ func rv32FoldCopies(lines []string) []string {
 }
 
 func rv32TmpReg(reg string) bool {
+	if reg == "q0" || reg == "q1" {
+		return true
+	}
 	return len(reg) == 2 && reg[0] == 't' && reg[1] >= '0' && reg[1] <= '6'
+}
+
+// canonReg maps the assembler pseudo-temporaries q0/q1 to the physical
+// registers they become.  They are a4/a5, which the emitter also uses for
+// call arguments, so every peephole register-identity check must see through
+// the alias; otherwise a cached value survives an argument write and the
+// cache hands the wrong value to a later use.
+func canonReg(reg string) string {
+	switch reg {
+	case "q0":
+		return "a4"
+	case "q1":
+		return "a5"
+	}
+	return reg
+}
+
+func sameReg(a, b string) bool { return canonReg(a) == canonReg(b) }
+
+var rv32QReg = regexp.MustCompile(`\bq[01]\b`)
+
+// rv32RenameScratch maps the pseudo-temporaries to the compressed-capable
+// argument registers.  The rename happens after the peephole so its temp
+// classification stays unambiguous: a4/a5 are also call arguments, and the
+// peephole must be able to tell the two roles apart.
+func rv32RenameScratch(src string) string {
+	return rv32QReg.ReplaceAllStringFunc(src, func(r string) string {
+		if r == "q0" {
+			return "a4"
+		}
+		return "a5"
+	})
 }
 
 func rv32Move(line string) (dst, src string, ok bool) {
@@ -551,7 +592,7 @@ func rv32Retarget(line, old, dst string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if rv32Writes(line) != old {
+	if !sameReg(rv32Writes(line), old) {
 		return "", false
 	}
 	switch dst {
@@ -565,7 +606,7 @@ func rv32Retarget(line, old, dst string) (string, bool) {
 	}
 	parts := strings.SplitN(body, ",", 2)
 	head := strings.Fields(parts[0])
-	if len(head) != 2 || head[1] != old {
+	if len(head) != 2 || !sameReg(head[1], old) {
 		return "", false
 	}
 	head[1] = dst
@@ -603,7 +644,7 @@ func rv32ReadBeforeWrite(lines []string, reg string) bool {
 		if rv32ReadsReg(body, reg) {
 			return true
 		}
-		if rv32Writes(line) == reg {
+		if sameReg(rv32Writes(line), reg) {
 			return false
 		}
 		switch fields[0] {
@@ -649,7 +690,7 @@ func rv32HasReg(body, reg string) bool {
 	for _, tok := range strings.FieldsFunc(body, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '_'
 	}) {
-		if tok == reg {
+		if sameReg(tok, reg) {
 			return true
 		}
 	}
