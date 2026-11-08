@@ -50,6 +50,13 @@ func EmitARM(m *Module, cpu string) (string, error) {
 	// the inline-literal path there; ARMv7-M/ARMv8-M keep the compact pools.
 	e.v6m = strings.HasPrefix(cpu, "cortex-m0") || strings.HasPrefix(cpu, "cortex-m1")
 	e.wide = !e.v6m
+	// Keep the loads of the locals that planRegVars will hold in r5-r7
+	// (ARMv6-M) or r5-r11 (Thumb-2) so forwarding does not undo that win.
+	regVars := 3
+	if e.wide {
+		regVars = 7
+	}
+	forwardDirectLoads(m, regVars, 3)
 	e.b.WriteString("\t.syntax unified\n\t.thumb\n\t.text\n")
 	for _, g := range m.Globals {
 		e.emitGlobal(g)

@@ -20,20 +20,16 @@ func findDirectAllocas(f *Func) map[string]bool {
 	return out
 }
 
-// planRegVars picks the hottest non-escaping scalar locals and gives each a
-// callee-saved register for the whole function.  Because the address never
-// escapes, every load and store of that object is visible here, so a register
-// is a faithful replacement for its memory cell across calls and blocks.
-func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []string) {
+// allocaCandidates lists the non-escaping scalar allocas that are worth a
+// callee-saved register: four bytes and at least minCount loads/stores, hottest
+// first.  planRegVars and the load-forwarding pass share it so that forwarding
+// never takes a load away from an object that is about to live in a register.
+func allocaCandidates(f *Func, minCount int) []allocaCand {
 	direct, count, size := analyzeAllocas(f)
-	type cand struct {
-		name string
-		n    int
-	}
-	var cs []cand
+	var cs []allocaCand
 	for name, ok := range direct {
 		if ok && size[name] == 4 && count[name] >= minCount {
-			cs = append(cs, cand{name, count[name]})
+			cs = append(cs, allocaCand{name, count[name]})
 		}
 	}
 	sort.Slice(cs, func(i, j int) bool {
@@ -42,6 +38,20 @@ func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []str
 		}
 		return cs[i].name < cs[j].name
 	})
+	return cs
+}
+
+type allocaCand struct {
+	name string
+	n    int
+}
+
+// planRegVars picks the hottest non-escaping scalar locals and gives each a
+// callee-saved register for the whole function.  Because the address never
+// escapes, every load and store of that object is visible here, so a register
+// is a faithful replacement for its memory cell across calls and blocks.
+func planRegVars(f *Func, regs []string, minCount int) (map[string]string, []string) {
+	cs := allocaCandidates(f, minCount)
 	vars := map[string]string{}
 	var used []string
 	for i, c := range cs {

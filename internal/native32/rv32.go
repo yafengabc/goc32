@@ -43,6 +43,9 @@ type rv32 struct {
 type loopCtx struct{ brk, cont string }
 
 func EmitRV32(m *Module) (string, error) {
+	// s0-s7 are the allocas that can stay in registers; forwarding must not
+	// take their loads away.
+	forwardDirectLoads(m, 8, 4)
 	e := &rv32{m: m}
 	e.b.WriteString("\t.text\n")
 	for _, g := range m.Globals {
