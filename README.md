@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 169,100 | 87,630 | 1.93x |
-| LZ4TOS total | 110,746 | 66,850 | 1.66x |
+| raw ELF total | 165,804 | 87,630 | 1.89x |
+| LZ4TOS total | 107,877 | 66,850 | 1.61x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,752 / 1,286 | 998 / 724 |
-| `hello_printf` | 3,380 / 2,217 | 1,606 / 1,202 |
-| `reloc` | 2,264 / 1,619 | 1,142 / 856 |
-| `wheap` | 4,360 / 2,884 | 1,974 / 1,550 |
-| `sh` | 28,132 / 16,502 | 16,054 / 12,589 |
+| `hello` | 1,688 / 1,234 | 998 / 724 |
+| `hello_printf` | 3,316 / 2,155 | 1,606 / 1,202 |
+| `reloc` | 2,232 / 1,569 | 1,142 / 856 |
+| `wheap` | 4,296 / 2,815 | 1,974 / 1,550 |
+| `sh` | 27,748 / 16,193 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -125,6 +125,9 @@ after the peephole were:
   kept in a callee-saved register (`s0-s7` on RV32).  A load is a snapshot of
   that register, so its uses can read the register directly instead of a
   stack slot; a store updates it.  Hot parameters use the remaining registers;
+- a parameter whose only use is the initial store to a direct local is written
+  straight from its incoming argument register in the prologue, and the store
+  instruction disappears;
 - dead pure SSA computations are removed before code generation;
 - the RV32 peephole forwards loads, deletes dead stores, sinks small constants
   into ALU instructions, turns multiply/divide by a power of two into shifts,

@@ -27,6 +27,8 @@ type rv32 struct {
 	sRegOff  map[string]int
 	regAlias map[string]string
 	aliasVar map[string]string
+	paramTgt map[string]string
+	skipInst map[*Inst]bool
 	cross    map[string]bool
 	lastUse  map[string]int
 	instIdx  int
@@ -262,6 +264,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.phiTmp = L.phiTmp
 	e.slotTy = L.slotTy
 	e.cross = L.cross
+	e.paramTgt, e.skipInst = findParamStores(f, e.direct, e.regVar)
 	cur := L.end
 	e.sRegOff = map[string]int{}
 	for _, r := range e.sRegs {
@@ -311,6 +314,22 @@ func (e *rv32) emitFunc(f *Func) error {
 		}
 		off := e.slots[p.Name]
 		for w := 0; w < words; w++ {
+			if target := e.paramTgt[p.Name]; target != "" && words == 1 {
+				src := ""
+				if ri < 8 {
+					src = fmt.Sprintf("a%d", ri)
+				} else {
+					e.loadSlot(e.frame+(ri-8)*4, "t0")
+					src = "t0"
+				}
+				if reg := e.regVar[target]; reg != "" {
+					e.line("mv %s, %s", reg, src)
+				} else {
+					e.storeSlot(e.allocas[target], src)
+				}
+				ri++
+				continue
+			}
 			if reg := e.paramReg[p.Name]; reg != "" && words == 1 {
 				if ri < 8 {
 					e.line("mv %s, a%d", reg, ri)
@@ -651,6 +670,9 @@ func (e *rv32) emitInst(in *Inst) error {
 		}
 		return e.storeDst(in.Dst, "t1")
 	case "store":
+		if e.skipInst[in] {
+			return nil
+		}
 		if v := in.Ops[1]; v.Kind == VLocal && e.direct[v.Name] {
 			sz := in.Ty.Size()
 			if reg := e.regVar[v.Name]; reg != "" {

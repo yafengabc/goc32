@@ -127,6 +127,67 @@ func planParamRegs(f *Func, regs []string, minCount int) (map[string]string, []s
 	return out, used
 }
 
+// findParamStores spots the common front-end shape
+//
+//	store i32 %param, ptr %local
+//
+// at the top of the entry block, where %local is a direct scalar alloca.  The
+// incoming argument register is still live there, so the prologue can write
+// it straight to the local and the store instruction can be dropped.
+func findParamStores(f *Func, direct map[string]bool, regVar map[string]string) (map[string]string, map[*Inst]bool) {
+	uses := map[string]int{}
+	for _, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			for _, op := range in.Ops {
+				if op.Kind == VLocal {
+					uses[op.Name]++
+				}
+			}
+			for _, c := range in.Cases {
+				if c.Val.Kind == VLocal {
+					uses[c.Val.Name]++
+				}
+			}
+			if in.Indirect && in.Callee != "" {
+				uses[in.Callee]++
+			}
+		}
+	}
+	isParam := map[string]bool{}
+	for _, p := range f.Params {
+		isParam[p.Name] = true
+	}
+	out := map[string]string{}
+	skip := map[*Inst]bool{}
+	if len(f.Blocks) == 0 {
+		return out, skip
+	}
+	for _, p := range f.Params {
+		if p.Ty == nil || p.Ty.Size() != 4 || uses[p.Name] != 1 {
+			continue
+		}
+		okPrefix := true
+		for _, in := range f.Blocks[0].Insts {
+			if in.Op == "store" && len(in.Ops) >= 2 &&
+				in.Ops[0].Kind == VLocal && in.Ops[0].Name == p.Name &&
+				in.Ops[1].Kind == VLocal && in.Ty != nil && in.Ty.Size() == 4 &&
+				(direct[in.Ops[1].Name] || regVar[in.Ops[1].Name] != "") && okPrefix {
+				out[p.Name] = in.Ops[1].Name
+				skip[in] = true
+				break
+			}
+			if in.Op == "alloca" || in.Op == "phi" {
+				continue
+			}
+			if in.Op == "store" && len(in.Ops) >= 2 && in.Ops[0].Kind == VLocal && isParam[in.Ops[0].Name] {
+				continue
+			}
+			okPrefix = false
+		}
+	}
+	return out, skip
+}
+
 func analyzeAllocas(f *Func) (map[string]bool, map[string]int, map[string]int) {
 	type info struct {
 		direct bool
