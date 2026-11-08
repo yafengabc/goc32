@@ -1,6 +1,10 @@
 package native32
 
-import "strings"
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
 
 // armPeephole is the small text pass over the finished Thumb assembly.  The
 // emitter lays blocks out in order, so a jump to the next label is redundant.
@@ -20,7 +24,107 @@ var armInvert = map[string]string{
 }
 
 func armPeephole(src string, wide bool) string {
-	return armJumpPeephole(armShrinkTrampolines(src, wide))
+	return armJumpPeephole(armSlotForward(armShrinkTrampolines(src, wide)))
+}
+
+var armWordSp = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
+
+var armRegRe = regexp.MustCompile(`^r(?:[0-9]|1[0-2])$`)
+
+// armNoDest lists the instructions whose first operand is not a destination.
+var armNoDest = map[string]bool{
+	"str": true, "strb": true, "strh": true, "strd": true,
+	"cmp": true, "cmn": true, "tst": true, "teq": true,
+	"b": true, "bl": true, "bx": true, "blx": true,
+	"nop": true, "svc": true, "dmb": true, "dsb": true, "isb": true,
+}
+
+func armWrites(body string) string {
+	f := strings.Fields(body)
+	if len(f) < 2 || armNoDest[f[0]] {
+		return ""
+	}
+	reg := strings.TrimSuffix(f[1], ",")
+	if !armRegRe.MatchString(reg) {
+		return ""
+	}
+	return reg
+}
+
+// armSlotForward tracks word-sized sp-relative stores within a basic block and
+// turns a later load of the same slot into a register move (or removes it).
+// Thumb has no equivalent of the RV32 slot cache, and the stack-machine
+// emitter stores many SSA results that are read again a few instructions
+// later.  Calls, labels and directives end the block and clear the cache.
+func armSlotForward(src string) string {
+	lines := strings.Split(src, "\n")
+	out := make([]string, 0, len(lines))
+	slotReg := map[int]string{}
+	clear := func() {
+		slotReg = map[int]string{}
+	}
+	kill := func(reg string) {
+		for off, q := range slotReg {
+			if q == reg {
+				delete(slotReg, off)
+			}
+		}
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "\t") {
+			clear()
+			out = append(out, line)
+			continue
+		}
+		body := strings.TrimSpace(line)
+		if body == "" {
+			out = append(out, line)
+			continue
+		}
+		if strings.HasPrefix(body, ".") {
+			if body == ".ltorg" {
+				clear()
+			}
+			out = append(out, line)
+			continue
+		}
+		if m := armWordSp.FindStringSubmatch(body); m != nil {
+			off := 0
+			if m[3] != "" {
+				off, _ = strconv.Atoi(m[3])
+			}
+			reg := m[2]
+			if m[1] == "str" {
+				slotReg[off] = reg
+				out = append(out, line)
+				continue
+			}
+			if q, ok := slotReg[off]; ok {
+				if q == reg {
+					continue
+				}
+				out = append(out, "\tmov "+reg+", "+q)
+				kill(reg)
+				slotReg[off] = reg
+				continue
+			}
+			// The load overwrites reg, so it can no longer hold a cached
+			// value for another slot; the loaded value is now its slot's.
+			kill(reg)
+			slotReg[off] = reg
+			out = append(out, line)
+			continue
+		}
+		f := strings.Fields(body)
+		if f[0] == "bl" || f[0] == "blx" || f[0] == "bx" || f[0] == "b" || f[0] == "pop" || armInvert[f[0]] != "" {
+			clear()
+		}
+		if reg := armWrites(body); reg != "" {
+			kill(reg)
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // armShrinkTrampolines replaces the emitter's long-branch trampoline

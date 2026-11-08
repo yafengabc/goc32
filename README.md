@@ -182,7 +182,9 @@ conditional branch is inverted when no literal pool sits between it and its
 fallthrough target, and `.ltorg` is emitted only for blocks that actually use
 a pool.  A comparison whose result is used only by a branch is emitted as a
 direct `cmp` + conditional branch instead of materialising a 0/1 value,
-storing it to the stack frame and reloading it for the branch.
+storing it to the stack frame and reloading it for the branch.  The text pass
+also keeps a block-local cache of word-sized `str/ldr [sp,#off]` pairs, so a
+value stored and read again becomes a register move (or disappears).
 
 A large part of the old Thumb size was the conservative long-branch
 trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
@@ -193,8 +195,8 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 32,264 bytes / 18,708 compressed on the
-Cortex-M3 target and 38,828 / 19,510 for the RP2040, down from 72 KB / 84 KB
+literal pools.  ARM `sh` is now 30,184 bytes / 18,078 compressed on the
+Cortex-M3 target and 37,708 / 19,187 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
