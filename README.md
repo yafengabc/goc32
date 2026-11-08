@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 156,988 | 87,630 | 1.79x |
-| LZ4TOS total | 106,765 | 66,850 | 1.60x |
+| raw ELF total | 156,604 | 87,630 | 1.79x |
+| LZ4TOS total | 106,248 | 66,850 | 1.59x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,656 / 1,223 | 998 / 724 |
-| `hello_printf` | 3,156 / 2,132 | 1,606 / 1,202 |
-| `reloc` | 2,200 / 1,554 | 1,142 / 856 |
-| `wheap` | 4,072 / 2,802 | 1,974 / 1,550 |
-| `sh` | 25,604 / 15,968 | 16,054 / 12,589 |
+| `hello` | 1,656 / 1,222 | 998 / 724 |
+| `hello_printf` | 3,156 / 2,109 | 1,606 / 1,202 |
+| `reloc` | 2,200 / 1,553 | 1,142 / 856 |
+| `wheap` | 4,072 / 2,775 | 1,974 / 1,550 |
+| `sh` | 25,572 / 15,920 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -140,9 +140,11 @@ after the peephole were:
   inverts a `bnez/beqz` + `j` pair when the branch target is the fallthrough;
 - small functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
-  The pool now sits at the bottom of the frame with its indices ranked by
-  access count, so hot temporaries get the short offsets Thumb and RVC can
-  encode compactly; `deep`'s recursive frame falls from 2,224 to 2,112 bytes.
+  The pool indices are ranked by access count, so hot temporaries get the
+  short offsets Thumb and RVC can encode compactly; `deep`'s recursive frame
+  falls from 2,224 to 2,112 bytes.  Thumb additionally puts the hot scalar
+  allocas below the pool and large aggregate allocas at the top of the frame,
+  keeping the common accesses inside a short `sp` offset.
 
 The same register-variable and parameter-store fusion runs on Thumb, using
 `r5-r7` (ARMv6-M ALU instructions only encode low registers) and writing
@@ -160,16 +162,16 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, only `r5-r7`
 can hold register variables, and constants/symbol addresses use literal
-pools.  ARM `sh` is now 38 KB on the Cortex-M3 target and 50 KB for the
+pools.  ARM `sh` is now 37 KB on the Cortex-M3 target and 48 KB for the
 RP2040, down from 72 KB / 84 KB before the trampoline rewrite and 199 KB
 originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
-default stack and relies on the kernel doubling it once; goc32's unoptimised
-frame for `recurse` is 4,400 bytes instead of roughly 2 KiB, which pushes the
-image into the next 16 KiB window grain and leaves no heap tail to grow into.
-`deep 1` runs, `deep` (six levels) still faults. Shrinking frames needs slot
-reuse or a register allocator.
+default stack and relies on the kernel doubling it once.  After the slot
+layout work the `recurse` frame is 2,112 bytes, the image stays inside one
+16 KiB window grain, and `deep 6` now grows the stack and completes with its
+journal intact (the deliberate `deep 6 0 8` variant still dies in the heap
+tail, as its documentation says it should).
 
 ## Layout
 

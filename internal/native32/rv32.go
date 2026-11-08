@@ -258,7 +258,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.sRegs = append(e.sRegs, usedParams...)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
-	L := layoutSlots(f, e.outBytes, 0, nil)
+	L := layoutSlots(f, e.outBytes, 0, nil, false)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp

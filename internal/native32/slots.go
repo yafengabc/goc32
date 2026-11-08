@@ -12,6 +12,17 @@ import "sort"
 // value's last use has been emitted, so the pool is only as large as the
 // maximum number of simultaneously live block-local values.
 
+func isAggregateAlloca(t *Type) bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind {
+	case KArray, KStruct:
+		return true
+	}
+	return t.Size() > 8
+}
+
 func blockLastUses(blk *Block) map[string]int {
 	m := map[string]int{}
 	for i, in := range blk.Insts {
@@ -41,7 +52,7 @@ type slotLayout struct {
 	end     int
 }
 
-func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLayout {
+func layoutSlots(f *Func, base, reserve int, skipSet map[string]string, thumb bool) *slotLayout {
 	L := &slotLayout{
 		slots:   map[string]int{},
 		allocas: map[string]int{},
@@ -241,66 +252,95 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 			}
 		}
 	}
-	poolBase := base + reserve
+	putAlloca := func(in *Inst) {
+		cur = align(cur, in.Ty.Align())
+		L.allocas[in.Dst] = cur
+		cur += in.Ty.Size()
+		if cur < 4 {
+			cur = 4
+		}
+		if phiUses[in.Dst] || cross[in.Dst] {
+			cur = align(cur, 4)
+			L.slots[in.Dst] = cur
+			L.slotTy[in.Dst] = dstTy(in)
+			cur += 4
+		}
+	}
+
+	// Thumb needs short sp-relative offsets for hot scalar locals, so there
+	// the scalar allocas sit at the bottom, the pool right above them, and
+	// large aggregate allocas are pushed to the top of the frame (they are
+	// reached through a rematerialised pointer anyway).  RV32 has a 12-bit
+	// load/store offset, so it keeps the compact pool-first order.
+	if thumb {
+		for _, blk := range f.Blocks {
+			for _, in := range blk.Insts {
+				if in.Op == "alloca" && in.Dst != "" && !isAggregateAlloca(in.Ty) {
+					putAlloca(in)
+				}
+			}
+		}
+	}
+
+	// The pool is the hot set, so it goes near the bottom of the frame where
+	// Thumb and RVC have a short load/store offset.
+	poolBase := align(cur, 4)
 	if uniqueMode {
 		cur = poolBase
 	} else {
 		cur = poolBase + maxNext*4
 	}
 
-	// Alloca objects.  The pointer slot is only needed when the pointer is
-	// copied by a phi; otherwise the back end rematerialises sp+offset.
-	for _, blk := range f.Blocks {
-		for _, in := range blk.Insts {
-			if in.Op != "alloca" || in.Dst == "" {
-				continue
-			}
-			cur = align(cur, in.Ty.Align())
-			L.allocas[in.Dst] = cur
-			cur += in.Ty.Size()
-			if cur < 4 {
-				cur = 4
-			}
-			if phiUses[in.Dst] || cross[in.Dst] {
-				cur = align(cur, 4)
-				L.slots[in.Dst] = cur
-				L.slotTy[in.Dst] = dstTy(in)
-				cur += 4
+	if !thumb {
+		for _, blk := range f.Blocks {
+			for _, in := range blk.Insts {
+				if in.Op == "alloca" && in.Dst != "" {
+					putAlloca(in)
+				}
 			}
 		}
 	}
 
-	// Permanent slots: parameters, values live across blocks, values used by
-	// a phi, and values wider than a word.
+	// Parameters and permanent slots, hottest first.  This keeps the most
+	// frequently read values at the short-offset end of the frame.
+	type permItem struct {
+		name string
+		ty   *Type
+		freq int
+	}
+	var items []permItem
 	for _, p := range f.Params {
-		sz := p.Ty.Size()
-		if sz < 4 {
-			sz = 4
+		ty := p.Ty
+		if ty == nil {
+			ty = &Type{Kind: KPtr}
 		}
-		cur = align(cur, 4)
-		L.slots[p.Name] = cur
-		L.slotTy[p.Name] = p.Ty
-		cur += sz
+		items = append(items, permItem{p.Name, ty, uses[p.Name] + 1})
 	}
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
-			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" {
+			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" || !permanent[in.Dst] {
 				continue
 			}
-			if !permanent[in.Dst] {
-				continue
-			}
-			ty := dstTy(in)
-			sz := ty.Size()
-			if sz < 4 {
-				sz = 4
-			}
-			cur = align(cur, max(4, min(8, ty.Align())))
-			L.slots[in.Dst] = cur
-			L.slotTy[in.Dst] = ty
-			cur += sz
+			items = append(items, permItem{in.Dst, dstTy(in), uses[in.Dst] + 1})
 		}
 	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].freq != items[j].freq {
+			return items[i].freq > items[j].freq
+		}
+		return items[i].name < items[j].name
+	})
+	for _, it := range items {
+		sz := it.ty.Size()
+		if sz < 4 {
+			sz = 4
+		}
+		cur = align(cur, max(4, min(8, it.ty.Align())))
+		L.slots[it.name] = cur
+		L.slotTy[it.name] = it.ty
+		cur += sz
+	}
+
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
 			if in.Op != "phi" {
@@ -316,10 +356,21 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLay
 		}
 	}
 
-	// Assign the pool slots at the bottom of the frame, below all permanent
-	// objects.  Hot block-local values get the lowest indices: the pool can
-	// reuse an index over time, so rank each index by the total number of
-	// accesses to the values that live there.
+	// Large Thumb allocas go last: every scalar access above stays within a
+	// short sp-relative offset.
+	if thumb {
+		for _, blk := range f.Blocks {
+			for _, in := range blk.Insts {
+				if in.Op == "alloca" && in.Dst != "" && isAggregateAlloca(in.Ty) {
+					putAlloca(in)
+				}
+			}
+		}
+	}
+
+	// Assign the pool slots at the bottom of the frame.  Hot block-local
+	// values get the lowest indices: the pool can reuse an index over time,
+	// so rank each index by the total number of accesses to its values.
 	freq := map[int]int{}
 	for name, idx := range poolIdx {
 		freq[idx] += uses[name] + 1

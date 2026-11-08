@@ -245,7 +245,7 @@ func (e *arm) emitFunc(f *Func) error {
 	e.regVar, e.sRegs = planRegVars(f, []string{"r5", "r6", "r7"}, 3)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
-	L := layoutSlots(f, e.outBytes, 4, nil)
+	L := layoutSlots(f, e.outBytes, 4, nil, true)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
