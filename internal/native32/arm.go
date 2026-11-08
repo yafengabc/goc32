@@ -41,6 +41,8 @@ type arm struct {
 	seq      int
 	v6m      bool
 	wide     bool
+	brCond   map[string]*Inst
+	skipCmp  map[*Inst]bool
 }
 
 func EmitARM(m *Module, cpu string) (string, error) {
@@ -230,6 +232,7 @@ func (e *arm) emitFunc(f *Func) error {
 	e.outBytes = 0
 	e.frame = 0
 	e.usedPool = false
+	e.brCond, e.skipCmp = planBranchConds(f)
 
 	maxStack := 0
 	for _, blk := range f.Blocks {
@@ -791,6 +794,9 @@ func (e *arm) emitInst(in *Inst) error {
 		"shl", "lshr", "ashr", "and", "or", "xor":
 		return e.emitBin(in)
 	case "icmp":
+		if e.skipCmp[in] {
+			return nil
+		}
 		return e.emitICmp(in)
 	case "br":
 		return e.emitBr(in)
@@ -1274,6 +1280,112 @@ func invCond(c string) string {
 	return "eq"
 }
 
+// planBranchConds finds comparison results whose only consumer is a branch in
+// the same block.  Such an icmp never needs to materialise a 0/1 value: the
+// branch can compare its operands directly, which also removes the store and
+// reload of the boolean slot.
+func planBranchConds(f *Func) (map[string]*Inst, map[*Inst]bool) {
+	def := map[string]*Inst{}
+	blockOf := map[string]int{}
+	uses := map[string]int{}
+	for bi, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			if in.Dst != "" {
+				def[in.Dst] = in
+				blockOf[in.Dst] = bi
+			}
+			for _, op := range in.Ops {
+				if op.Kind == VLocal {
+					uses[op.Name]++
+				}
+			}
+			for _, c := range in.Cases {
+				if c.Val.Kind == VLocal {
+					uses[c.Val.Name]++
+				}
+			}
+			if in.Indirect && in.Callee != "" {
+				uses[in.Callee]++
+			}
+		}
+	}
+	byName := map[string]*Inst{}
+	skip := map[*Inst]bool{}
+	for bi, blk := range f.Blocks {
+		for _, in := range blk.Insts {
+			if in.Op != "br" || len(in.Labels) != 2 || len(in.Ops) == 0 || in.Ops[0].Kind != VLocal {
+				continue
+			}
+			name := in.Ops[0].Name
+			d := def[name]
+			if d == nil || d.Op != "icmp" || d.Ty == nil || d.Ty.Size() > 4 ||
+				uses[name] != 1 || blockOf[name] != bi {
+				continue
+			}
+			byName[name] = d
+			skip[d] = true
+		}
+	}
+	return byName, skip
+}
+
+func armCond(pred string) (string, bool) {
+	switch pred {
+	case "eq":
+		return "eq", true
+	case "ne":
+		return "ne", true
+	case "slt":
+		return "lt", true
+	case "sgt":
+		return "gt", true
+	case "sle":
+		return "le", true
+	case "sge":
+		return "ge", true
+	case "ult":
+		return "lo", true
+	case "ugt":
+		return "hi", true
+	case "ule":
+		return "ls", true
+	case "uge":
+		return "hs", true
+	}
+	return "", false
+}
+
+func (e *arm) emitBrCmp(in, cmp *Inst) error {
+	if len(cmp.Ops) != 2 {
+		return fmt.Errorf("icmp with %d operands", len(cmp.Ops))
+	}
+	rA, err := e.loadValTo(cmp.Ops[0], "r0")
+	if err != nil {
+		return err
+	}
+	rB, err := e.loadValTo(cmp.Ops[1], "r1")
+	if err != nil {
+		return err
+	}
+	cond, ok := armCond(cmp.Pred)
+	if !ok {
+		return fmt.Errorf("unsupported icmp predicate %s", cmp.Pred)
+	}
+	tr := e.newLabel()
+	e.line("cmp %s, %s", rA, rB)
+	e.condBranch(cond, tr)
+	if err := e.emitPhiCopies(in.Labels[1], e.cur); err != nil {
+		return err
+	}
+	e.jump(blockLabel(e.fn, in.Labels[1]))
+	e.label(tr)
+	if err := e.emitPhiCopies(in.Labels[0], e.cur); err != nil {
+		return err
+	}
+	e.jump(blockLabel(e.fn, in.Labels[0]))
+	return nil
+}
+
 func (e *arm) emitBr(in *Inst) error {
 	if len(in.Labels) == 1 {
 		if err := e.emitPhiCopies(in.Labels[0], e.cur); err != nil {
@@ -1281,6 +1393,11 @@ func (e *arm) emitBr(in *Inst) error {
 		}
 		e.jump(blockLabel(e.fn, in.Labels[0]))
 		return nil
+	}
+	if len(in.Ops) > 0 && in.Ops[0].Kind == VLocal {
+		if d := e.brCond[in.Ops[0].Name]; d != nil {
+			return e.emitBrCmp(in, d)
+		}
 	}
 	cond, err := e.loadValTo(in.Ops[0], "r0")
 	if err != nil {
