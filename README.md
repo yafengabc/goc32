@@ -99,25 +99,27 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 161,260 | 87,630 | 1.84x |
-| LZ4TOS total | 107,867 | 66,850 | 1.61x |
+| raw ELF total | 159,372 | 87,630 | 1.82x |
+| LZ4TOS total | 107,236 | 66,850 | 1.60x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,688 / 1,226 | 998 / 724 |
-| `hello_printf` | 3,220 / 2,152 | 1,606 / 1,202 |
-| `reloc` | 2,200 / 1,558 | 1,142 / 856 |
-| `wheap` | 4,136 / 2,818 | 1,974 / 1,550 |
-| `sh` | 27,044 / 16,220 | 16,054 / 12,589 |
+| `hello` | 1,656 / 1,223 | 998 / 724 |
+| `hello_printf` | 3,156 / 2,132 | 1,606 / 1,202 |
+| `reloc` | 2,200 / 1,554 | 1,142 / 856 |
+| `wheap` | 4,072 / 2,801 | 1,974 / 1,550 |
+| `sh` | 26,788 / 16,160 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
 
 - array subscripts and pointer arithmetic now emit a real `getelementptr`
   with an i32 index instead of `ptrtoint -> mul i64 -> add i64 -> inttoptr`;
-  the old form dragged every subscript through a 64-bit pair and carry chain;
+  the old form dragged every subscript through a 64-bit pair and carry chain.
+  The GEP also consumes a base or index already in a register directly and
+  folds constant offsets into one `addi`;
 - a non-escaping scalar local (`char`, `short`, `int`, pointer, double) is
   addressed directly as `sp+offset` for its loads and stores, so the alloca
   pointer is never materialised and the object needs no pointer slot;

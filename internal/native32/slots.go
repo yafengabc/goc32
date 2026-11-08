@@ -39,7 +39,7 @@ type slotLayout struct {
 	end     int
 }
 
-func layoutSlots(f *Func, base, reserve int) *slotLayout {
+func layoutSlots(f *Func, base, reserve int, skipSet map[string]string) *slotLayout {
 	L := &slotLayout{
 		slots:   map[string]int{},
 		allocas: map[string]int{},
@@ -130,7 +130,7 @@ func layoutSlots(f *Func, base, reserve int) *slotLayout {
 	}
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
-			if in.Dst == "" || in.Op == "alloca" {
+			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" {
 				continue
 			}
 			ty := dstTy(in)
@@ -202,7 +202,7 @@ func layoutSlots(f *Func, base, reserve int) *slotLayout {
 	permanent := map[string]bool{}
 	for _, blk := range f.Blocks {
 		for _, in := range blk.Insts {
-			if in.Dst == "" || in.Op == "alloca" {
+			if in.Dst == "" || in.Op == "alloca" || skipSet[in.Dst] != "" {
 				continue
 			}
 			ty := dstTy(in)
@@ -271,7 +271,7 @@ func layoutSlots(f *Func, base, reserve int) *slotLayout {
 			}
 		}
 		for i, in := range blk.Insts {
-			if in.Dst != "" && !permanent[in.Dst] && in.Op != "alloca" {
+			if in.Dst != "" && !permanent[in.Dst] && in.Op != "alloca" && skipSet[in.Dst] == "" {
 				ty := dstTy(in)
 				if ty.Size() <= 4 && ty.Align() <= 4 {
 					var idx int

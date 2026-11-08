@@ -258,7 +258,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	e.sRegs = append(e.sRegs, usedParams...)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
-	L := layoutSlots(f, e.outBytes, 0)
+	L := layoutSlots(f, e.outBytes, 0, nil)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
@@ -785,10 +785,28 @@ func (e *rv32) emitInst(in *Inst) error {
 }
 
 func (e *rv32) emitGEP(in *Inst) error {
-	if err := e.loadVal(in.Ops[0], "t0"); err != nil {
+	base, err := e.loadValTo(in.Ops[0], "t0")
+	if err != nil {
 		return err
 	}
+	curReg := base
 	cur := in.Ty
+	addConst := func(off int) {
+		if off == 0 {
+			return
+		}
+		if curReg == "t0" {
+			e.addImm("t0", off)
+			return
+		}
+		if off >= -2048 && off <= 2047 {
+			e.line("addi t0, %s, %d", curReg, off)
+		} else {
+			e.line("li t5, %d", off)
+			e.line("add t0, %s, t5", curReg)
+		}
+		curReg = "t0"
+	}
 	for i := 1; i < len(in.Ops); i++ {
 		idx := in.Ops[i]
 		var scale int
@@ -807,25 +825,37 @@ func (e *rv32) emitGEP(in *Inst) error {
 				off = align(off, cur.Fields[j].Align()) + cur.Fields[j].Size()
 			}
 			cur = cur.Fields[int(idx.I)]
-			e.addImm("t0", off)
+			addConst(off)
 			continue
 		} else {
 			scale = 1
 		}
 		if idx.Kind == VInt {
-			e.addImm("t0", int(idx.I)*scale)
-		} else {
-			if err := e.loadVal(idx, "t1"); err != nil {
-				return err
-			}
-			if scale != 1 {
-				e.line("li t2, %d", scale)
-				e.line("mul t1, t1, t2")
-			}
-			e.line("add t0, t0, t1")
+			addConst(int(idx.I) * scale)
+			continue
 		}
+		idxReg, err := e.loadValTo(idx, "t1")
+		if err != nil {
+			return err
+		}
+		if scale == 1 {
+			e.line("add t0, %s, %s", curReg, idxReg)
+		} else {
+			if scale&(scale-1) == 0 {
+				k := 0
+				for s := scale; s > 1; s >>= 1 {
+					k++
+				}
+				e.line("slli t1, %s, %d", idxReg, k)
+			} else {
+				e.line("li t2, %d", scale)
+				e.line("mul t1, %s, t2", idxReg)
+			}
+			e.line("add t0, %s, t1", curReg)
+		}
+		curReg = "t0"
 	}
-	return e.storeDst(in.Dst, "t0")
+	return e.storeDst(in.Dst, curReg)
 }
 
 func (e *rv32) emitBin(in *Inst) error {
