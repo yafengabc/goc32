@@ -178,7 +178,16 @@ func layoutSlots(f *Func, base, reserve int, skipSet map[string]string, thumb bo
 			est += sz
 		}
 	}
-	uniqueMode := est-cur <= 2048
+	// Thumb pays for frame size twice: its sp-relative offsets are short and
+	// its loads/stores become 32-bit once past them, so it always uses the
+	// liveness pool.  RV32 keeps one slot per value in small functions so the
+	// peephole can still prove individual stores dead; its 12-bit offsets are
+	// cheap enough that a larger frame costs less than the lost store removal.
+	limit := 2048
+	if thumb {
+		limit = 0
+	}
+	uniqueMode := est-cur <= limit
 
 	// Mark the values that need dedicated slots.  In unique mode that is every
 	// value; otherwise only values crossing blocks, used by a phi, or wider

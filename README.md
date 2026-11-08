@@ -158,8 +158,10 @@ after the peephole were:
   a bare `xori 1` flips the branch), and `xori x, y, 0` disappears; this
   removes most of the boolean materialisation the stack-machine emitter
   produces;
-- small functions keep one slot per value so the peephole can prove stores
+- small RV32 functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
+  Thumb cares more about frame size than about per-value store proof, so it
+  always uses the pool and keeps the hottest slots at short offsets.
   The pool indices are ranked by access count, so hot temporaries get the
   short offsets Thumb and RVC can encode compactly; `deep`'s recursive frame
   falls from 2,224 to 2,112 bytes.  Thumb additionally puts the hot scalar
@@ -186,8 +188,8 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 36,008 bytes / 22,909 compressed on the
-Cortex-M3 target and 45,788 / 25,091 for the RP2040, down from 72 KB / 84 KB
+literal pools.  ARM `sh` is now 35,272 bytes / 19,209 compressed on the
+Cortex-M3 target and 42,508 / 20,053 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
