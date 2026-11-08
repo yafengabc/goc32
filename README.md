@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 144,940 | 87,630 | 1.65x |
-| LZ4TOS total | 99,614 | 66,850 | 1.49x |
+| raw ELF total | 136,636 | 87,630 | 1.56x |
+| LZ4TOS total | 97,581 | 66,850 | 1.46x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,592 / 1,151 | 998 / 724 |
-| `hello_printf` | 2,964 / 1,992 | 1,606 / 1,202 |
-| `reloc` | 2,072 / 1,469 | 1,142 / 856 |
-| `wheap` | 3,816 / 2,634 | 1,974 / 1,550 |
-| `sh` | 23,460 / 15,116 | 16,054 / 12,589 |
+| `hello` | 1,560 / 1,116 | 998 / 724 |
+| `hello_printf` | 2,740 / 1,946 | 1,606 / 1,202 |
+| `reloc` | 2,040 / 1,440 | 1,142 / 856 |
+| `wheap` | 3,528 / 2,555 | 1,974 / 1,550 |
+| `sh` | 22,116 / 14,925 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -153,6 +153,11 @@ after the peephole were:
   into ALU instructions, turns multiply/divide by a power of two into shifts,
   rewrites `li 0 + sw` as `sw zero`, drops jumps to the following label, and
   inverts a `bnez/beqz` + `j` pair when the branch target is the fallthrough;
+- a comparison whose only consumer is a branch is fused into that branch
+  (`slt` + `xori 1` + `beqz` becomes `blt`, `snez` + `beqz` becomes `beqz`,
+  a bare `xori 1` flips the branch), and `xori x, y, 0` disappears; this
+  removes most of the boolean materialisation the stack-machine emitter
+  produces;
 - small functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
   The pool indices are ranked by access count, so hot temporaries get the

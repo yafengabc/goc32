@@ -218,7 +218,279 @@ func peepholeRV32Func(lines []string) []string {
 		}
 		res = append(res, line)
 	}
-	return rv32DropJumps(rv32InvertBranches(rv32ZeroStores(rv32FoldImmediates(rv32FoldCopies(res)))))
+	out = rv32FuseSetcc(rv32FoldImmediates(rv32FoldCopies(res)))
+	out = rv32FoldCopies(out)
+	return rv32DropJumps(rv32InvertBranches(rv32ZeroStores(out)))
+}
+
+// rv32FuseSetcc removes the materialisation of a boolean that is only tested
+// by the next branch, and folds the surrounding xori chains:
+//
+//	xori a, b, 0        ->  (no-op)
+//	xori a, b, 0        ->  snez a, b
+//	snez a, b           ->  ...
+//	snez a, b           ->  beqz b, L
+//	beqz a, L
+//	slt a, b, c         ->  bge b, c, L
+//	xori a, a, 1
+//	beqz a, L
+//
+// The emitter lays out comparisons as setcc + xori + branch; a stack-machine
+// code generator produces many of them and the intermediates are dead once
+// the branch has read them.  A move immediately followed by a store of the
+// same register is folded as well.
+func rv32FuseSetcc(lines []string) []string {
+	for pass := 0; pass < 4; pass++ {
+		out := make([]string, 0, len(lines))
+		changed := false
+		for i := 0; i < len(lines); i++ {
+			body, _, ok := rv32Body(lines[i])
+			if !ok {
+				out = append(out, lines[i])
+				continue
+			}
+			// xori rd, rs, 0 is the front end's cast-to-bool no-op.
+			if rd, rs, imm, ok := rv32ParseXori(body); ok && imm == 0 {
+				if i+1 < len(lines) {
+					if nb, _, ok := rv32Body(lines[i+1]); ok {
+						if s, ok := rv32ParseSetcc(nb); ok &&
+							(s.op == "snez" || s.op == "seqz") && s.rd == rd && s.ra == rd {
+							out = append(out, "\t"+s.op+" "+rd+", "+rs)
+							i++
+							changed = true
+							continue
+						}
+					}
+				}
+				changed = true
+				if rd != rs {
+					out = append(out, "\tmv "+rd+", "+rs)
+				}
+				continue
+			}
+			// A boolean NOT that only feeds a branch flips the branch.
+			if rd, rs, imm, ok := rv32ParseXori(body); ok && imm == 1 && i+1 < len(lines) {
+				if nb, _, ok := rv32Body(lines[i+1]); ok {
+					if bop, breg, btgt, ok := rv32ParseBranch(nb); ok && breg == rd &&
+						rv32VolatileReg(rd) && !rv32ReadBeforeWrite(lines[i+2:], rd) {
+						inv := "beqz"
+						if bop == "beqz" {
+							inv = "bnez"
+						}
+						out = append(out, "\t"+inv+" "+rs+", "+btgt)
+						i++
+						changed = true
+						continue
+					}
+				}
+			}
+			// xor of two registers tested by a branch is an equality test.
+			if rd, ra, rb, ok := rv32ParseXor(body); ok && i+1 < len(lines) {
+				if nb, _, ok := rv32Body(lines[i+1]); ok {
+					if bop, breg, btgt, ok := rv32ParseBranch(nb); ok && breg == rd &&
+						rv32VolatileReg(rd) && !rv32ReadBeforeWrite(lines[i+2:], rd) {
+						br := "beq"
+						if bop == "bnez" {
+							br = "bne"
+						}
+						if rb == "zero" || rb == "x0" {
+							if br == "beq" {
+								out = append(out, "\tbeqz "+ra+", "+btgt)
+							} else {
+								out = append(out, "\tbnez "+ra+", "+btgt)
+							}
+						} else {
+							out = append(out, "\t"+br+" "+ra+", "+rb+", "+btgt)
+						}
+						i++
+						changed = true
+						continue
+					}
+				}
+			}
+			// move followed by a branch on that register.
+			if d, s, ok := rv32Move(lines[i]); ok && i+1 < len(lines) {
+				if nb, _, ok := rv32Body(lines[i+1]); ok {
+					if bop, breg, btgt, ok := rv32ParseBranch(nb); ok && breg == d &&
+						rv32VolatileReg(d) && !rv32ReadBeforeWrite(lines[i+2:], d) {
+						out = append(out, "\t"+bop+" "+s+", "+btgt)
+						i++
+						changed = true
+						continue
+					}
+				}
+			}
+			// move followed by a store of that register.
+			if d, s, ok := rv32Move(lines[i]); ok && i+1 < len(lines) {
+				if nb, comment, ok := rv32Body(lines[i+1]); ok {
+					if f := strings.Fields(strings.ReplaceAll(nb, ",", " ")); len(f) == 3 &&
+						(f[0] == "sw" || f[0] == "sb" || f[0] == "sh") && f[1] == d &&
+						rv32VolatileReg(d) && !rv32ReadBeforeWrite(lines[i+2:], d) {
+						nl := "\t" + f[0] + " " + s + ", " + f[2]
+						if comment != "" {
+							nl += " " + comment
+						}
+						out = append(out, nl)
+						i++
+						changed = true
+						continue
+					}
+				}
+			}
+			// compare + optional xori 1 + branch.
+			if s, ok := rv32ParseSetcc(body); ok {
+				fused := false
+				for extra := 0; extra <= 1 && !fused; extra++ {
+					if i+extra+1 >= len(lines) {
+						break
+					}
+					nb, _, ok := rv32Body(lines[i+extra+1])
+					if !ok {
+						break
+					}
+					if extra == 1 {
+						xr, xs, xi, ok := rv32ParseXori(nb)
+						if !ok || xi != 1 || xr != s.rd || xs != s.rd {
+							break
+						}
+						if i+extra+2 >= len(lines) {
+							break
+						}
+						nb, _, ok = rv32Body(lines[i+extra+2])
+						if !ok {
+							break
+						}
+					}
+					bop, breg, btgt, ok := rv32ParseBranch(nb)
+					if !ok || breg != s.rd {
+						break
+					}
+					after := i + extra + 2
+					if !rv32VolatileReg(s.rd) || rv32ReadBeforeWrite(lines[after:], s.rd) {
+						break
+					}
+					br, ok := rv32BranchFor(s, bop, extra == 1)
+					if !ok {
+						break
+					}
+					out = append(out, "\t"+br+", "+btgt)
+					i += extra + 1
+					changed = true
+					fused = true
+				}
+				if fused {
+					continue
+				}
+			}
+			out = append(out, lines[i])
+		}
+		lines = out
+		if !changed {
+			break
+		}
+	}
+	return lines
+}
+
+func rv32ParseXor(body string) (rd, ra, rb string, ok bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 4 || f[0] != "xor" {
+		return "", "", "", false
+	}
+	return f[1], f[2], f[3], true
+}
+
+func rv32ParseXori(body string) (rd, rs string, imm int64, ok bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 4 || f[0] != "xori" {
+		return "", "", 0, false
+	}
+	v, err := strconv.ParseInt(f[3], 10, 64)
+	if err != nil {
+		return "", "", 0, false
+	}
+	return f[1], f[2], v, true
+}
+
+func rv32ParseBranch(body string) (op, reg, target string, ok bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) != 3 || (f[0] != "beqz" && f[0] != "bnez") {
+		return "", "", "", false
+	}
+	return f[0], f[1], f[2], true
+}
+
+type rv32Setcc struct {
+	op     string
+	rd     string
+	ra     string
+	rb     string
+	hasImm bool
+}
+
+func rv32ParseSetcc(body string) (rv32Setcc, bool) {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) < 3 {
+		return rv32Setcc{}, false
+	}
+	s := rv32Setcc{op: f[0], rd: f[1], ra: f[2]}
+	switch f[0] {
+	case "snez", "seqz":
+		return s, len(f) == 3
+	case "slt", "sltu":
+		if len(f) != 4 {
+			return rv32Setcc{}, false
+		}
+		s.rb = f[3]
+		return s, true
+	case "slti", "sltiu":
+		if len(f) != 4 {
+			return rv32Setcc{}, false
+		}
+		s.hasImm = true
+		return s, true
+	}
+	return rv32Setcc{}, false
+}
+
+// rv32BranchFor maps a setcc result tested by beqz/bnez to the direct
+// branch.  negated selects the xori 1 (inverted comparison) form.
+func rv32BranchFor(s rv32Setcc, branch string, negated bool) (string, bool) {
+	if s.hasImm {
+		return "", false
+	}
+	beqz := branch == "beqz"
+	switch s.op {
+	case "snez":
+		if negated {
+			beqz = !beqz
+		}
+		if beqz {
+			return "beqz " + s.ra, true
+		}
+		return "bnez " + s.ra, true
+	case "seqz":
+		if negated {
+			beqz = !beqz
+		}
+		if beqz {
+			return "bnez " + s.ra, true
+		}
+		return "beqz " + s.ra, true
+	case "slt", "sltu":
+		if negated {
+			beqz = !beqz
+		}
+		bge, blt := "bge", "blt"
+		if s.op == "sltu" {
+			bge, blt = "bgeu", "bltu"
+		}
+		if beqz {
+			return bge + " " + s.ra + ", " + s.rb, true
+		}
+		return blt + " " + s.ra + ", " + s.rb, true
+	}
+	return "", false
 }
 
 // rv32FoldImmediates sinks a small constant into the ALU instruction that
@@ -553,6 +825,26 @@ func canonReg(reg string) string {
 }
 
 func sameReg(a, b string) bool { return canonReg(a) == canonReg(b) }
+
+// rv32VolatileReg reports a register that is dead at block boundaries and
+// clobbered by calls: the scratch temporaries and the caller-saved a-regs.
+// The fusion rules may only use it for liveness, because rv32ReadBeforeWrite
+// treats a call as a kill and a label as a block end.
+func rv32VolatileReg(reg string) bool {
+	switch reg {
+	case "q0", "q1":
+		return true
+	}
+	if len(reg) == 2 {
+		if reg[0] == 't' && reg[1] >= '0' && reg[1] <= '6' {
+			return true
+		}
+		if reg[0] == 'a' && reg[1] >= '0' && reg[1] <= '7' {
+			return true
+		}
+	}
+	return false
+}
 
 var rv32QReg = regexp.MustCompile(`\bq[01]\b`)
 
