@@ -36,6 +36,8 @@ var armMovRe = regexp.MustCompile(`^mov (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))
 var armAlu3Re = regexp.MustCompile(`^(adds|subs) (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
 var armCmpRe = regexp.MustCompile(`^cmp (r(?:[0-9]|1[0-2])), (#-?[0-9]+|r(?:[0-9]|1[0-2]))$`)
 var armStrOpRe = regexp.MustCompile(`^(str|strb|strh) (r(?:[0-9]|1[0-2])), (.+)$`)
+var armMemBaseRe = regexp.MustCompile(`^(ldr|ldrb|ldrh|ldrsb|ldrsh|str|strb|strh) (r(?:[0-9]|1[0-2])), \[(r(?:[0-9]|1[0-2]))(, #-?[0-9]+)?\]$`)
+var armUnaryRe = regexp.MustCompile(`^(sxtb|sxth|uxtb|uxth|mvn|mvns) (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
 var armAddR4 = regexp.MustCompile(`^add r4, sp, #(-?[0-9]+)$`)
 var armR4Word = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[r4\]$`)
 var armR4Sized = regexp.MustCompile(`^(strb|ldrb|ldrsb|strh|ldrh|ldrsh) (r(?:[0-9]|1[0-2])), \[r4\]$`)
@@ -212,6 +214,22 @@ func armFoldMoves(src string, wide bool) string {
 							nl += " " + lines[i+1][strings.Index(lines[i+1], "@"):]
 						}
 						out = append(out, nl)
+						i++
+						continue
+					}
+					if m4 := armMemBaseRe.FindStringSubmatch(nb); m4 != nil && m4[3] == rd &&
+						(wide || armLow(rs)) && !(strings.HasPrefix(m4[1], "str") && m4[2] == rd) {
+						out = append(out, "\t"+m4[1]+" "+m4[2]+", ["+rs+m4[4]+"]")
+						i++
+						continue
+					}
+					if m5 := armUnaryRe.FindStringSubmatch(nb); m5 != nil && m5[3] == rd {
+						out = append(out, "\t"+m5[1]+" "+m5[2]+", "+rs)
+						i++
+						continue
+					}
+					if m6 := armMovRe.FindStringSubmatch(nb); m6 != nil && m6[2] == rd {
+						out = append(out, "\tmov "+m6[1]+", "+rs)
 						i++
 						continue
 					}
