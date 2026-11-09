@@ -99,18 +99,18 @@ optimisation runs, so images are larger than clang's. Measured over all 37
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 136,284 | 87,630 | 1.56x |
-| LZ4TOS total | 97,367 | 66,850 | 1.46x |
+| raw ELF total | 135,100 | 87,630 | 1.54x |
+| LZ4TOS total | 97,039 | 66,850 | 1.45x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
 | `hello` | 1,560 / 1,116 | 998 / 724 |
-| `hello_printf` | 2,740 / 1,945 | 1,606 / 1,202 |
+| `hello_printf` | 2,708 / 1,933 | 1,606 / 1,202 |
 | `reloc` | 2,040 / 1,438 | 1,142 / 856 |
-| `wheap` | 3,528 / 2,558 | 1,974 / 1,550 |
-| `sh` | 21,988 / 14,875 | 16,054 / 12,589 |
+| `wheap` | 3,496 / 2,551 | 1,974 / 1,550 |
+| `sh` | 21,796 / 14,823 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -160,7 +160,10 @@ after the peephole were:
   produces;
 - `addi p, sp, off; load/store x, 0(p)` (and the same with one GEP offset
   folded in) becomes a direct `off(sp)` access when `p` is dead afterwards,
-  removing the alloca pointer materialisation;
+  removing the alloca pointer materialisation; one address computation can
+  feed several accesses and the whole run is folded;
+- empty RV32 blocks that contain only a `j` are threaded away, the same way as
+  the Thumb ones;
 - small RV32 functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
   Thumb cares more about frame size than about per-value store proof, so it
@@ -188,8 +191,8 @@ the register copies left by the slot cache into the consuming `cmp`/store, and
 turns `movs rX, #imm; cmp rD, rX` / `adds rD, rN, rX` into the immediate forms
 when the scratch register is dead afterwards.  A copy is also folded into a
 load/store base, a sign/zero extend, or a second move.  Empty blocks that contain only
-a `b` are threaded away on ARMv7-M/ARMv8-M, where a branch can reach any point
-in the function; a block that can be entered by fallthrough is kept.
+a `b` are threaded away; ARMv7-M/ARMv8-M can branch anywhere in the function,
+while ARMv6-M retargets only within the short conditional/unconditional range.
 The cache keeps word-sized `str/ldr [sp,#off]` pairs within a block, so a
 value stored and read again becomes a register move (or disappears); word
 stores that no surviving load reads are deleted, except the outgoing stack
@@ -208,7 +211,7 @@ sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
 literal pools.  ARM `sh` is now 26,024 bytes / 16,859 compressed on the
-Cortex-M3 target and 31,628 / 17,708 for the RP2040, down from 72 KB / 84 KB
+Cortex-M3 target and 30,956 / 17,722 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB

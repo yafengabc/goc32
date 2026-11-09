@@ -18,9 +18,6 @@ import (
 var armBranchRe = regexp.MustCompile(`^(b|b(?:eq|ne|lt|ge|gt|le|lo|hs|hi|ls|mi|pl|vs|vc)) ([\w.]+)$`)
 
 func armThreadBlocks(src string, wide bool) string {
-	if !wide {
-		return src
-	}
 	for pass := 0; pass < 8; pass++ {
 		lines := strings.Split(src, "\n")
 		labelAt := map[string]int{}
@@ -83,6 +80,19 @@ func armThreadBlocks(src string, wide bool) string {
 				continue
 			}
 			if d, ok := dest[m[2]]; ok {
+				if !wide {
+					pos, okp := labelAt[d]
+					if !okp {
+						continue
+					}
+					limit := 45 // Thumb-1 conditional range is +/-256 bytes
+					if m[1] == "b" {
+						limit = 200 // and the unconditional range is +/-2 KiB
+					}
+					if absInt(pos-i) > limit {
+						continue
+					}
+				}
 				lines[i] = "\t" + m[1] + " " + d
 				changed = true
 			}

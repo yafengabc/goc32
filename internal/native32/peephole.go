@@ -99,6 +99,7 @@ func rv32Writes(line string) string {
 }
 
 func peepholeRV32Func(lines []string) []string {
+	lines = rv32ThreadBlocksFunc(lines)
 	largeFrame := false
 	for _, line := range lines {
 		if strings.HasPrefix(line, "\tli t5,") || strings.HasPrefix(line, "\tli t6,") {
@@ -449,52 +450,95 @@ func rv32FoldAddrAccess(body, ptr string, off int) (string, bool) {
 	return "\t" + f[0] + " " + f[1] + ", " + strconv.Itoa(off) + "(sp)", true
 }
 
-// rv32FoldAllocaAddrs turns
+func rv32BranchOrCall(body string) bool {
+	f := strings.Fields(body)
+	if len(f) == 0 {
+		return false
+	}
+	switch f[0] {
+	case "j", "jr", "ret", "tail", "call", "jal", "jalr", "unreachable",
+		"beqz", "bnez", "beq", "bne", "blt", "bge", "bltu", "bgeu", "ble", "bgt":
+		return true
+	}
+	return false
+}
+
+// rv32FoldAllocaAddrs turns a materialised sp+off pointer and every access
+// through it into direct sp-relative accesses:
 //
-//	addi q0, sp, OFF        addi q0, sp, OFF
-//	OP   x, 0(q0)           addi q0, q0, ADD
-//	                        OP   x, 0(q0)
+//	addi q0, sp, OFF        OP   x, OFF(sp)
+//	OP   x, 0(q0)           OP   y, OFF+ADD(sp)
+//	addi q0, q0, ADD
+//	OP   y, 0(q0)
 //
-// into OP x, OFF(sp) / OP x, (OFF+ADD)(sp) when the pointer temporary is dead
-// afterwards.  Direct allocas are the main source of the address arithmetic.
+// The run is abandoned if the pointer is read in any other way.  A load into
+// the pointer or any other write ends the run; the pointer is then dead.
 func rv32FoldAllocaAddrs(lines []string) []string {
-	out := make([]string, 0, len(lines))
-	changed := false
+	type fold struct {
+		idx  int
+		line string
+	}
+	replace := map[int]string{}
+	drop := map[int]bool{}
 	for i := 0; i < len(lines); i++ {
-		if body, _, ok := rv32Body(lines[i]); ok {
-			if p, off, ok := rv32ParseAddiSp(body); ok && rv32VolatileReg(p) {
-				if i+1 < len(lines) {
-					if nb, _, ok := rv32Body(lines[i+1]); ok {
-						if nl, ok := rv32FoldAddrAccess(nb, p, off); ok &&
-							!rv32ReadBeforeWrite(lines[i+2:], p) {
-							out = append(out, nl)
-							i++
-							changed = true
-							continue
-						}
-					}
+		body, _, ok := rv32Body(lines[i])
+		if !ok {
+			continue
+		}
+		p, off, ok := rv32ParseAddiSp(body)
+		if !ok || !rv32TmpReg(p) {
+			continue
+		}
+		var folds []fold
+		var chain []int
+		cur := off
+		abort := false
+		for j := i + 1; j < len(lines); j++ {
+			nb, _, ok := rv32Body(lines[j])
+			if !ok || strings.HasPrefix(nb, ".") || rv32BranchOrCall(nb) {
+				break
+			}
+			if n, ok := rv32ParseAddiSelf(nb, p); ok {
+				cur += n
+				chain = append(chain, j)
+				continue
+			}
+			if nl, ok := rv32FoldAddrAccess(nb, p, cur); ok {
+				folds = append(folds, fold{j, nl})
+				if rv32Writes(lines[j]) == p {
+					break
 				}
-				if i+2 < len(lines) {
-					if b1, _, ok := rv32Body(lines[i+1]); ok {
-						if add, ok := rv32ParseAddiSelf(b1, p); ok {
-							if b2, _, ok := rv32Body(lines[i+2]); ok {
-								if nl, ok := rv32FoldAddrAccess(b2, p, off+add); ok &&
-									!rv32ReadBeforeWrite(lines[i+3:], p) {
-									out = append(out, nl)
-									i += 2
-									changed = true
-									continue
-								}
-							}
-						}
-					}
-				}
+				continue
+			}
+			if rv32Writes(lines[j]) == p {
+				break
+			}
+			if rv32ReadsReg(nb, p) {
+				abort = true
+				break
 			}
 		}
-		out = append(out, lines[i])
+		if abort || len(folds) == 0 {
+			continue
+		}
+		for _, f := range folds {
+			replace[f.idx] = f.line
+		}
+		drop[i] = true
+		for _, c := range chain {
+			drop[c] = true
+		}
 	}
-	if changed {
-		return rv32FoldAllocaAddrs(out)
+	out := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if drop[i] {
+			continue
+		}
+		if nl, ok := replace[i]; ok {
+			out = append(out, nl)
+			continue
+		}
+		out = append(out, line)
 	}
 	return out
 }
