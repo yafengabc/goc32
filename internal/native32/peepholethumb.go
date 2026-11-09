@@ -34,6 +34,9 @@ var armSizeSp = regexp.MustCompile(`^((?:ldrb|ldrh|ldrsb|ldrsh)) (r(?:[0-9]|1[0-
 var armMovRe = regexp.MustCompile(`^mov (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
 var armCmpRe = regexp.MustCompile(`^cmp (r(?:[0-9]|1[0-2])), (#-?[0-9]+|r(?:[0-9]|1[0-2]))$`)
 var armStrOpRe = regexp.MustCompile(`^(str|strb|strh) (r(?:[0-9]|1[0-2])), (.+)$`)
+var armAddR4 = regexp.MustCompile(`^add r4, sp, #(-?[0-9]+)$`)
+var armR4Word = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[r4\]$`)
+var armR4Sized = regexp.MustCompile(`^(strb|ldrb|ldrsb|strh|ldrh|ldrsh) (r(?:[0-9]|1[0-2])), \[r4\]$`)
 
 func armStripComment(s string) string {
 	if i := strings.IndexByte(s, '@'); i >= 0 {
@@ -76,6 +79,10 @@ func armVolatile(reg string) bool {
 
 func armLow(reg string) bool {
 	return len(reg) == 2 && reg[0] == 'r' && reg[1] >= '0' && reg[1] <= '7'
+}
+
+func armLoadOp(op string) bool {
+	return op == "ldrb" || op == "ldrh" || op == "ldrsb" || op == "ldrsh"
 }
 
 func armHasReg(s, reg string) bool {
@@ -163,6 +170,10 @@ func armFoldMoves(src string, wide bool) string {
 // emitter stores many SSA results that are read again a few instructions
 // later.  Calls, labels and directives end the block and clear the cache.
 //
+// ARMv6-M addresses slots beyond 124 bytes (and byte/halfword slots) through
+// r4; `add r4, sp, #off` plus `[r4]` is treated as the same slot as
+// `[sp,#off]`, with r4's known offset invalidated by any other write to r4.
+//
 // Once a function has been processed, word stores to slots that no surviving
 // load reads are deleted.  Stores marked with @ goc32keep (outgoing stack
 // arguments and the vararg register save area) are never removed.
@@ -171,7 +182,9 @@ func armSlotForward(src string) string {
 	out := make([]string, 0, len(lines))
 	slotReg := map[int]string{}
 	used := map[int]bool{}
+	storeOff := map[int]int{} // output index -> frame offset
 	funcStart := 0
+	r4Off := -1
 	clear := func() {
 		slotReg = map[int]string{}
 	}
@@ -182,62 +195,117 @@ func armSlotForward(src string) string {
 			}
 		}
 	}
-	spOff := func(m []string) int {
+	offsetOf := func(m []string) int {
 		if m[3] == "" {
 			return 0
 		}
 		off, _ := strconv.Atoi(m[3])
 		return off
 	}
+	// r4 address calculations are emitted lazily so that a load which is
+	// folded away does not leave a dead `add r4, sp, #off` behind.
+	pendR4 := ""
+	flush := func() {
+		if pendR4 != "" {
+			out = append(out, pendR4)
+			pendR4 = ""
+		}
+	}
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "\t") {
+			flush()
 			clear()
 			out = append(out, line)
 			continue
 		}
 		body := strings.TrimSpace(line)
 		if body == "" {
+			flush()
 			out = append(out, line)
 			continue
 		}
 		if strings.HasPrefix(body, ".section .text.") {
+			flush()
 			used = map[int]bool{}
+			storeOff = map[int]int{}
+			r4Off = -1
 			funcStart = len(out)
 			clear()
 			out = append(out, line)
 			continue
 		}
 		if strings.HasPrefix(body, ".size ") {
-			kept := out[:funcStart]
-			for _, l := range out[funcStart:] {
-				b := armStripComment(strings.TrimSpace(l))
-				if m := armWordSp.FindStringSubmatch(b); m != nil && m[1] == "str" {
-					off := spOff(m)
-					if !used[off] && !strings.Contains(l, "goc32keep") {
-						continue
+			pendR4 = ""
+			dead := map[int]bool{}
+			for idx := funcStart; idx < len(out); idx++ {
+				if off, ok := storeOff[idx]; ok && !used[off] {
+					dead[idx] = true
+				}
+			}
+			// A dead store also makes its address calculation dead when the
+			// next surviving line recomputes r4 or leaves the block.
+			for idx := funcStart; idx < len(out); idx++ {
+				if !dead[idx] || idx <= funcStart || dead[idx-1] {
+					continue
+				}
+				prev := strings.TrimSpace(out[idx-1])
+				if !armAddR4.MatchString(prev) || strings.Contains(out[idx-1], "goc32keep") {
+					continue
+				}
+				n := idx + 1
+				for n < len(out) && dead[n] {
+					n++
+				}
+				safe := true
+				if n < len(out) {
+					nb := strings.TrimSpace(out[n])
+					if strings.HasPrefix(out[n], "\t") && !strings.HasPrefix(nb, ".") &&
+						!armAddR4.MatchString(nb) && armHasReg(nb, "r4") {
+						safe = false
 					}
 				}
-				kept = append(kept, l)
+				if safe {
+					dead[idx-1] = true
+				}
+			}
+			kept := out[:funcStart]
+			for idx := funcStart; idx < len(out); idx++ {
+				if dead[idx] {
+					continue
+				}
+				kept = append(kept, out[idx])
 			}
 			out = kept
 			used = map[int]bool{}
+			storeOff = map[int]int{}
 			funcStart = len(out)
+			r4Off = -1
 			clear()
 			out = append(out, line)
 			continue
 		}
 		if strings.HasPrefix(body, ".") {
+			flush()
 			if body == ".ltorg" {
 				clear()
 			}
 			out = append(out, line)
 			continue
 		}
+		if m := armAddR4.FindStringSubmatch(body); m != nil {
+			r4Off, _ = strconv.Atoi(m[1])
+			kill("r4")
+			pendR4 = line
+			continue
+		}
+		// Sp-relative word slot.
 		if m := armWordSp.FindStringSubmatch(body); m != nil {
-			off := spOff(m)
+			flush()
+			off := offsetOf(m)
 			reg := m[2]
 			if m[1] == "str" {
 				slotReg[off] = reg
+				storeOff[len(out)] = off
 				out = append(out, line)
 				continue
 			}
@@ -258,16 +326,69 @@ func armSlotForward(src string) string {
 			out = append(out, line)
 			continue
 		}
-		// Byte/halfword loads are not forwarded but still read their slot.
+		// Byte/halfword sp loads are not forwarded but still read their slot.
 		if m := armSizeSp.FindStringSubmatch(body); m != nil {
-			used[spOff(m)] = true
+			used[offsetOf(m)] = true
 		}
+		// r4-addressed slot.
+		if r4Off >= 0 {
+			off := r4Off
+			if m := armR4Word.FindStringSubmatch(body); m != nil {
+				reg := m[2]
+				if m[1] == "str" {
+					flush()
+					slotReg[off] = reg
+					storeOff[len(out)] = off
+					out = append(out, line)
+					continue
+				}
+				if q, ok := slotReg[off]; ok {
+					// The address calculation is dead once the load folds.
+					pendR4 = ""
+					if q == reg {
+						continue
+					}
+					out = append(out, "\tmov "+reg+", "+q)
+					kill(reg)
+					slotReg[off] = reg
+					if reg == "r4" {
+						r4Off = -1
+					}
+					continue
+				}
+				flush()
+				kill(reg)
+				slotReg[off] = reg
+				used[off] = true
+				if reg == "r4" {
+					r4Off = -1
+				}
+				out = append(out, line)
+				continue
+			}
+			if m := armR4Sized.FindStringSubmatch(body); m != nil {
+				flush()
+				if armLoadOp(m[1]) {
+					used[off] = true
+					kill(m[2])
+				}
+				if m[2] == "r4" {
+					r4Off = -1
+				}
+				out = append(out, line)
+				continue
+			}
+		}
+		flush()
 		f := strings.Fields(body)
 		if f[0] == "bl" || f[0] == "blx" || f[0] == "bx" || f[0] == "b" || f[0] == "pop" || armInvert[f[0]] != "" {
 			clear()
 		}
 		if reg := armWrites(body); reg != "" {
 			kill(reg)
+			if reg == "r4" {
+				r4Off = -1
+			}
 		}
 		out = append(out, line)
 	}

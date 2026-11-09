@@ -90,3 +90,34 @@ func TestArmFoldMoves(t *testing.T) {
 		t.Fatalf("live copy folded: %q", got)
 	}
 }
+
+func TestArmSlotForwardR4(t *testing.T) {
+	in := []string{
+		"\t.section .text.f,\"ax\",%progbits",
+		"f:",
+		"\tadd r4, sp, #252",
+		"\tstr r0, [r4]",
+		"\tadd r4, sp, #252",
+		"\tldr r1, [r4]",
+		"\tstr r0, [r4]",
+		"\tadd r4, sp, #252",
+		"\tldr r2, [r4]",
+		"\tadds r4, #4",
+		"\tstr r3, [r4]",
+		"\tret",
+		"\t.size f, .-f",
+	}
+	want := []string{
+		"\t.section .text.f,\"ax\",%progbits",
+		"f:",
+		"\tmov r1, r0",
+		"\tmov r2, r0",
+		"\tadds r4, #4",
+		"\tstr r3, [r4]",
+		"\tret",
+		"\t.size f, .-f",
+	}
+	if got := strings.Split(armSlotForward(strings.Join(in, "\n")), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("armSlotForward r4:\n got %q\nwant %q", got, want)
+	}
+}

@@ -188,7 +188,10 @@ the register copies left by the slot cache into the consuming `cmp`/store.
 The cache keeps word-sized `str/ldr [sp,#off]` pairs within a block, so a
 value stored and read again becomes a register move (or disappears); word
 stores that no surviving load reads are deleted, except the outgoing stack
-argument area and the vararg register save area (`@ goc32keep`).
+argument area and the vararg register save area (`@ goc32keep`).  On
+ARMv6-M, `add r4, sp, #off` followed by `[r4]` addresses the same slot, so
+frames past the 124-byte sp range get the same treatment; the cached offset
+is invalidated by any other write to r4.
 
 A large part of the old Thumb size was the conservative long-branch
 trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
@@ -200,7 +203,7 @@ sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
 literal pools.  ARM `sh` is now 27,912 bytes / 17,111 compressed on the
-Cortex-M3 target and 35,692 / 18,632 for the RP2040, down from 72 KB / 84 KB
+Cortex-M3 target and 32,748 / 17,872 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
