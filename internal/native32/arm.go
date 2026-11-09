@@ -27,6 +27,7 @@ type arm struct {
 	sRegOff  map[string]int
 	regAlias map[string]string
 	aliasVar map[string]string
+	alloc    map[string]string
 	cross    map[string]bool
 	lastUse  map[string]int
 	instIdx  int
@@ -267,7 +268,13 @@ func (e *arm) emitFunc(f *Func) error {
 	e.regVar, e.sRegs = planRegVars(f, regs, 3)
 	e.regAlias = map[string]string{}
 	e.aliasVar = map[string]string{}
-	L := layoutSlots(f, e.outBytes, 4, nil, true)
+	first := layoutSlots(f, e.outBytes, 4, nil, true)
+	e.alloc = planARMBlockAlloc(f, first.cross, e.regVar)
+	skip := map[string]string{}
+	for name := range e.alloc {
+		skip[name] = "reg"
+	}
+	L := layoutSlots(f, e.outBytes, 4, skip, true)
 	e.slots = L.slots
 	e.allocas = L.allocas
 	e.phiTmp = L.phiTmp
@@ -600,6 +607,12 @@ func (e *arm) adjustSP(n int) {
 func (e *arm) loadVal(v Value, reg string) error {
 	switch v.Kind {
 	case VLocal:
+		if src, ok := e.alloc[v.Name]; ok {
+			if reg != src {
+				e.line("mov %s, %s", reg, src)
+			}
+			return nil
+		}
 		if src, ok := e.regAlias[v.Name]; ok {
 			e.line("mov %s, %s", reg, src)
 			return nil
@@ -632,11 +645,31 @@ func (e *arm) li(reg string, v uint64) {
 		e.line("movs %s, #%d", reg, v)
 		return
 	}
+	// A byte shifted into place costs two Thumb-1 instructions (4 bytes),
+	// much less than an inline literal (12 bytes) or a pool word plus load.
+	if sh, ok := armShiftedByte(v); ok {
+		e.line("movs %s, #%d", reg, v>>sh)
+		e.line("lsls %s, %s, #%d", reg, reg, sh)
+		return
+	}
 	e.litLoad(reg, fmt.Sprintf("%d", v))
+}
+
+// armShiftedByte reports a shift that turns v into an 8-bit immediate.
+func armShiftedByte(v uint64) (uint, bool) {
+	for sh := uint(1); sh < 32; sh++ {
+		if v>>sh <= 255 && v&((uint64(1)<<sh)-1) == 0 {
+			return sh, true
+		}
+	}
+	return 0, false
 }
 
 func (e *arm) loadValTo(v Value, scratch string) (string, error) {
 	if v.Kind == VLocal {
+		if src, ok := e.alloc[v.Name]; ok {
+			return src, nil
+		}
 		if src, ok := e.regAlias[v.Name]; ok {
 			return src, nil
 		}
@@ -648,6 +681,12 @@ func (e *arm) loadValTo(v Value, scratch string) (string, error) {
 }
 
 func (e *arm) storeDst(name, reg string) error {
+	if dst := e.alloc[name]; dst != "" {
+		if reg != dst {
+			e.line("mov %s, %s", dst, reg)
+		}
+		return nil
+	}
 	off, ok := e.slots[name]
 	if !ok {
 		return fmt.Errorf("unknown destination %%%s", name)
@@ -690,9 +729,19 @@ func (e *arm) emitInst(in *Inst) error {
 		e.addrOf(e.allocas[in.Dst], "r0")
 		return e.storeDst(in.Dst, "r0")
 	case "load":
+		dst := "r1"
+		if r, ok := e.alloc[in.Dst]; ok {
+			dst = r
+		}
 		if v := in.Ops[0]; v.Kind == VLocal && e.direct[v.Name] {
 			off := e.allocas[v.Name]
 			if reg := e.regVar[v.Name]; reg != "" {
+				if dst != "r1" {
+					if dst != reg {
+						e.line("mov %s, %s", dst, reg)
+					}
+					return nil
+				}
 				if !e.cross[in.Dst] {
 					e.regAlias[in.Dst] = reg
 					e.aliasVar[in.Dst] = v.Name
@@ -702,42 +751,43 @@ func (e *arm) emitInst(in *Inst) error {
 			} else if in.Ty.Size() == 8 {
 				e.loadSlot(off, "r1")
 				e.loadSlot(off+4, "r2")
-				dst := e.slots[in.Dst]
-				e.storeSlotReg(dst, "r1")
-				e.storeSlotReg(dst+4, "r2")
+				off2 := e.slots[in.Dst]
+				e.storeSlotReg(off2, "r1")
+				e.storeSlotReg(off2+4, "r2")
 				return nil
 			} else {
-				e.loadSized(off, in.Ty.Size(), "r1")
+				e.loadSized(off, in.Ty.Size(), dst)
 			}
-			return e.storeDst(in.Dst, "r1")
+			return e.storeDst(in.Dst, dst)
 		}
-		if err := e.loadVal(in.Ops[0], "r0"); err != nil {
+		base, err := e.loadValTo(in.Ops[0], "r0")
+		if err != nil {
 			return err
 		}
 		sz := in.Ty.Size()
 		switch sz {
 		case 1:
-			e.line("ldrb r1, [r0]")
+			e.line("ldrb %s, [%s]", dst, base)
 		case 2:
-			e.line("ldrh r1, [r0]")
+			e.line("ldrh %s, [%s]", dst, base)
 		case 4:
-			e.line("ldr r1, [r0]")
+			e.line("ldr %s, [%s]", dst, base)
 		case 8:
 			off := e.slots[in.Dst]
-			e.line("ldr r1, [r0]")
-			e.line("ldr r2, [r0, #4]")
+			e.line("ldr r1, [%s]", base)
+			e.line("ldr r2, [%s, #4]", base)
 			e.storeSlotReg(off, "r1")
 			e.storeSlotReg(off+4, "r2")
 			return nil
 		default:
 			off := e.slots[in.Dst]
 			for i := 0; i < sz; i += 4 {
-				e.line("ldr r1, [r0, #%d]", i)
+				e.line("ldr r1, [%s, #%d]", base, i)
 				e.storeSlotReg(off+i, "r1")
 			}
 			return nil
 		}
-		return e.storeDst(in.Dst, "r1")
+		return e.storeDst(in.Dst, dst)
 	case "store":
 		if e.skipInst[in] {
 			return nil
@@ -782,20 +832,27 @@ func (e *arm) emitInst(in *Inst) error {
 			e.storeSized(e.allocas[v.Name], sz, "r0")
 			return nil
 		}
+		sz := in.Ty.Size()
+		if sz == 1 || sz == 2 || sz == 4 {
+			val, err := e.loadValTo(in.Ops[0], "r0")
+			if err != nil {
+				return err
+			}
+			ptr, err := e.loadValTo(in.Ops[1], "r1")
+			if err != nil {
+				return err
+			}
+			op := map[int]string{1: "strb", 2: "strh", 4: "str"}[sz]
+			e.line("%s %s, [%s]", op, val, ptr)
+			return nil
+		}
 		if err := e.loadVal(in.Ops[0], "r0"); err != nil {
 			return err
 		}
 		if err := e.loadVal(in.Ops[1], "r1"); err != nil {
 			return err
 		}
-		sz := in.Ty.Size()
 		switch sz {
-		case 1:
-			e.line("strb r0, [r1]")
-		case 2:
-			e.line("strh r0, [r1]")
-		case 4:
-			e.line("str r0, [r1]")
 		case 8:
 			off := e.slots[in.Ops[0].Name]
 			e.loadSlot(off+4, "r2")
@@ -928,6 +985,10 @@ func (e *arm) emitBin(in *Inst) error {
 	if wide {
 		return e.emitBin64(in)
 	}
+	out := "r0"
+	if r, ok := e.alloc[in.Dst]; ok {
+		out = r
+	}
 	rA, err := e.loadValTo(in.Ops[0], "r0")
 	if err != nil {
 		return err
@@ -936,29 +997,30 @@ func (e *arm) emitBin(in *Inst) error {
 	if err != nil {
 		return err
 	}
-	toR0 := func() {
-		if rA != "r0" {
-			e.line("movs r0, %s", rA)
+	toOut := func() {
+		if rA != out {
+			e.line("movs %s, %s", out, rA)
 		}
 	}
 	switch in.Op {
 	case "add":
-		e.line("adds r0, %s, %s", rA, rB)
+		e.line("adds %s, %s, %s", out, rA, rB)
 	case "sub":
-		e.line("subs r0, %s, %s", rA, rB)
+		e.line("subs %s, %s, %s", out, rA, rB)
 	case "mul":
-		toR0()
+		toOut()
 		if highReg(rB) {
 			// MUL only encodes low registers; the high register is a
-			// Thumb-2 register-variable candidate.  A square can reuse r0.
+			// Thumb-2 register-variable candidate.  A square can reuse the
+			// destination.
 			if rA == rB {
-				rB = "r0"
+				rB = out
 			} else {
 				e.line("movs r1, %s", rB)
 				rB = "r1"
 			}
 		}
-		e.line("muls r0, %s", rB)
+		e.line("muls %s, %s", out, rB)
 	case "sdiv", "udiv", "srem", "urem":
 		if rA != "r0" {
 			e.line("mov r0, %s", rA)
@@ -979,27 +1041,27 @@ func (e *arm) emitBin(in *Inst) error {
 			e.line("movs r0, r1")
 		}
 	case "shl":
-		toR0()
-		e.line("lsls r0, %s", rB)
+		toOut()
+		e.line("lsls %s, %s", out, rB)
 	case "lshr":
-		toR0()
-		e.line("lsrs r0, %s", rB)
+		toOut()
+		e.line("lsrs %s, %s", out, rB)
 	case "ashr":
-		toR0()
-		e.line("asrs r0, %s", rB)
+		toOut()
+		e.line("asrs %s, %s", out, rB)
 	case "and":
-		toR0()
-		e.line("ands r0, %s", rB)
+		toOut()
+		e.line("ands %s, %s", out, rB)
 	case "or":
-		toR0()
-		e.line("orrs r0, %s", rB)
+		toOut()
+		e.line("orrs %s, %s", out, rB)
 	case "xor":
-		toR0()
-		e.line("eors r0, %s", rB)
+		toOut()
+		e.line("eors %s, %s", out, rB)
 	default:
 		return fmt.Errorf("unsupported binop %s", in.Op)
 	}
-	return e.storeDst(in.Dst, "r0")
+	return e.storeDst(in.Dst, out)
 }
 
 func (e *arm) emitBin64(in *Inst) error {
@@ -1091,6 +1153,10 @@ func (e *arm) emitICmp(in *Inst) error {
 	if in.Ty.Size() > 4 {
 		return e.emitICmp64(in)
 	}
+	out := "r0"
+	if r, ok := e.alloc[in.Dst]; ok {
+		out = r
+	}
 	rA, err := e.loadValTo(in.Ops[0], "r0")
 	if err != nil {
 		return err
@@ -1128,12 +1194,12 @@ func (e *arm) emitICmp(in *Inst) error {
 	t, done := e.newLabel(), e.newLabel()
 	e.line("cmp %s, %s", rA, rB)
 	e.condBranch(cond, t)
-	e.line("movs r0, #0")
+	e.line("movs %s, #0", out)
 	e.jump(done)
 	e.label(t)
-	e.line("movs r0, #1")
+	e.line("movs %s, #1", out)
 	e.label(done)
-	return e.storeDst(in.Dst, "r0")
+	return e.storeDst(in.Dst, out)
 }
 
 func (e *arm) emitICmp64(in *Inst) error {

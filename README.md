@@ -100,8 +100,8 @@ with a small block-local register allocator layered on top.  Measured over all
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 132,892 | 87,630 | 1.52x |
-| LZ4TOS total | 95,894 | 66,850 | 1.43x |
+| raw ELF total | 132,604 | 87,630 | 1.51x |
+| LZ4TOS total | 95,640 | 66,850 | 1.43x |
 
 Examples (raw ELF / LZ4TOS):
 
@@ -110,8 +110,8 @@ Examples (raw ELF / LZ4TOS):
 | `hello` | 1,560 / 1,112 | 998 / 724 |
 | `hello_printf` | 2,644 / 1,905 | 1,606 / 1,202 |
 | `reloc` | 2,040 / 1,440 | 1,142 / 856 |
-| `wheap` | 3,400 / 2,492 | 1,974 / 1,550 |
-| `sh` | 21,444 / 14,676 | 16,054 / 12,589 |
+| `wheap` | 3,400 / 2,477 | 1,974 / 1,550 |
+| `sh` | 21,380 / 14,596 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -124,7 +124,7 @@ after the peephole were:
 - a non-escaping scalar local (`char`, `short`, `int`, pointer, double) is
   addressed directly as `sp+offset` for its loads and stores, so the alloca
   pointer is never materialised and the object needs no pointer slot;
-- a non-escaping word local that is read or written at least four times is
+- a non-escaping word local that is read or written at least five times is
   kept in a callee-saved register (`s0-s7` on RV32).  A load is a snapshot of
   that register, so its uses can read the register directly instead of a
   stack slot; a store updates it.  Hot parameters use the remaining registers;
@@ -138,7 +138,10 @@ after the peephole were:
   allocated when some use would otherwise need a copy out of `q0`; a value
   that every use can read from the scratch register is left in place.
   Values crossing a block, allocas, phi destinations and blocks containing a
-  call keep their slots;
+  call keep their slots.  Cross-block values were also measured against the
+  free `s0-s7` registers, but the front end keeps C locals in allocas, so the
+  remaining temporaries are too few (and too cheap after `q0` forwarding) to
+  repay the prologue save/restore;
 - a call result consumed by the next instruction stays in `a0` instead of
   taking the stack round trip, and memory stores use an already-live value or
   pointer register directly;
@@ -167,10 +170,11 @@ after the peephole were:
   a bare `xori 1` flips the branch), and `xori x, y, 0` disappears; this
   removes most of the boolean materialisation the stack-machine emitter
   produces;
-- `addi p, sp, off; load/store x, 0(p)` (and the same with one GEP offset
-  folded in) becomes a direct `off(sp)` access when `p` is dead afterwards,
-  removing the alloca pointer materialisation; one address computation can
-  feed several accesses and the whole run is folded;
+- `addi p, base, off; load/store x, 0(p)` (with any base register, and with
+  `addi p, p, add` GEP steps folded in) becomes a direct `off(base)` access
+  when `p` is dead afterwards, removing the pointer materialisation; the run
+  stops if the base itself is written, and one address computation can feed
+  several accesses;
 - empty RV32 blocks that contain only a `j` are threaded away, the same way as
   the Thumb ones;
 - small RV32 functions keep one slot per value so the peephole can prove stores
@@ -210,6 +214,17 @@ ARMv6-M, `add r4, sp, #off` followed by `[r4]` addresses the same slot, so
 frames past the 124-byte sp range get the same treatment; the cached offset
 is invalidated by any other write to r4.
 
+A block-local value whose use would otherwise copy it out of `r0` (a second
+ALU operand or a store address) can live in `r2`; the producer writes `r2`
+directly, so the definition store and the copy at each use disappear.  `r2` is
+caller-saved and unused by scalar code, but blocks containing a 64-bit
+operation, an aggregate/8-byte memory access, a division helper or an
+intrinsic keep their slots because those paths use `r2` as scratch.  `r3` is
+not offered to the allocator: the range-independent Thumb-1 jump materialises
+its target there.  A constant that is a byte shifted into place is built with
+`movs` + `lsls` instead of a literal; on ARMv6-M that is 4 bytes rather than
+the 12-byte inline literal block.
+
 A large part of the old Thumb size was the conservative long-branch
 trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
 .balign 4; .word target`, and `sh` had 1,665 of them (6.6 KiB of words plus
@@ -219,8 +234,8 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 26,024 bytes / 16,859 compressed on the
-Cortex-M3 target and 30,956 / 17,722 for the RP2040, down from 72 KB / 84 KB
+literal pools.  ARM `sh` is now 25,832 bytes / 16,761 compressed on the
+Cortex-M3 target and 30,460 / 17,560 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB

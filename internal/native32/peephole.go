@@ -394,16 +394,16 @@ func rv32FuseSetcc(lines []string) []string {
 	return lines
 }
 
-func rv32ParseAddiSp(body string) (string, int, bool) {
+func rv32ParseAddi(body string) (dst, src string, off int, ok bool) {
 	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
-	if len(f) != 4 || f[0] != "addi" || f[2] != "sp" {
-		return "", 0, false
+	if len(f) != 4 || f[0] != "addi" {
+		return "", "", 0, false
 	}
 	v, err := strconv.Atoi(f[3])
 	if err != nil {
-		return "", 0, false
+		return "", "", 0, false
 	}
-	return f[1], v, true
+	return f[1], f[2], v, true
 }
 
 // rv32ParseAddiSelf parses "addi reg, reg, imm".
@@ -421,7 +421,7 @@ func rv32ParseAddiSelf(body, reg string) (int, bool) {
 
 // rv32FoldAddrAccess rewrites a load/store through a just-materialised
 // sp+off pointer into a direct sp-relative access.
-func rv32FoldAddrAccess(body, ptr string, off int) (string, bool) {
+func rv32FoldAddrAccess(body, ptr, base string, off int) (string, bool) {
 	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
 	if len(f) != 3 || f[2] != "0("+ptr+")" {
 		return "", false
@@ -447,7 +447,7 @@ func rv32FoldAddrAccess(body, ptr string, off int) (string, bool) {
 			return "", false // the stored value is the pointer itself
 		}
 	}
-	return "\t" + f[0] + " " + f[1] + ", " + strconv.Itoa(off) + "(sp)", true
+	return "\t" + f[0] + " " + f[1] + ", " + strconv.Itoa(off) + "(" + base + ")", true
 }
 
 func rv32BranchOrCall(body string) bool {
@@ -485,8 +485,8 @@ func rv32FoldAllocaAddrs(lines []string) []string {
 		if !ok {
 			continue
 		}
-		p, off, ok := rv32ParseAddiSp(body)
-		if !ok || !rv32TmpReg(p) {
+		p, base, off, ok := rv32ParseAddi(body)
+		if !ok || p == base || !rv32VolatileReg(p) {
 			continue
 		}
 		var folds []fold
@@ -503,14 +503,14 @@ func rv32FoldAllocaAddrs(lines []string) []string {
 				chain = append(chain, j)
 				continue
 			}
-			if nl, ok := rv32FoldAddrAccess(nb, p, cur); ok {
+			if nl, ok := rv32FoldAddrAccess(nb, p, base, cur); ok {
 				folds = append(folds, fold{j, nl})
-				if rv32Writes(lines[j]) == p {
+				if w := rv32Writes(lines[j]); w == p || w == base {
 					break
 				}
 				continue
 			}
-			if rv32Writes(lines[j]) == p {
+			if w := rv32Writes(lines[j]); w == p || w == base {
 				break
 			}
 			if rv32ReadsReg(nb, p) {

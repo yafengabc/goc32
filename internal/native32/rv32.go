@@ -256,7 +256,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	// sp+offset unless a phi copies them.
 	e.direct = findDirectAllocas(f)
 	regs := []string{"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"}
-	e.regVar, e.sRegs = planRegVars(f, regs, 4)
+	e.regVar, e.sRegs = planRegVars(f, regs, 5)
 	var usedParams []string
 	e.paramReg, usedParams = planParamRegs(f, remainingRegs(regs, e.sRegs), 3)
 	e.sRegs = append(e.sRegs, usedParams...)
