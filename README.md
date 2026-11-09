@@ -100,8 +100,8 @@ with a small block-local register allocator layered on top.  Measured over all
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 132,604 | 87,630 | 1.51x |
-| LZ4TOS total | 95,640 | 66,850 | 1.43x |
+| raw ELF total | 132,476 | 87,630 | 1.51x |
+| LZ4TOS total | 95,488 | 66,850 | 1.43x |
 
 Examples (raw ELF / LZ4TOS):
 
@@ -111,7 +111,7 @@ Examples (raw ELF / LZ4TOS):
 | `hello_printf` | 2,644 / 1,905 | 1,606 / 1,202 |
 | `reloc` | 2,040 / 1,440 | 1,142 / 856 |
 | `wheap` | 3,400 / 2,477 | 1,974 / 1,550 |
-| `sh` | 21,380 / 14,596 | 16,054 / 12,589 |
+| `sh` | 21,380 / 14,571 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -177,6 +177,13 @@ after the peephole were:
   several accesses;
 - empty RV32 blocks that contain only a `j` are threaded away, the same way as
   the Thumb ones;
+- a function called exactly once that is at most 40 IR instructions is inlined
+  at that call site, and the out-of-line body is dropped when its address is
+  never taken.  The pass runs only when the program is one input file, so a
+  sibling translation unit cannot reference the removed symbol.  Larger
+  functions stay out of line: the stack-machine frame grows when the callee's
+  values merge into the caller, and that already costs more than the removed
+  call at around 80 instructions.  ARMv6-M is excluded for the same reason;
 - small RV32 functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
   Thumb cares more about frame size than about per-value store proof, so it
@@ -234,7 +241,7 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 25,800 bytes / 16,721 compressed on the
+literal pools.  ARM `sh` is now 25,832 bytes / 16,751 compressed on the
 Cortex-M3 target and 30,460 / 17,563 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.  On ARMv7-M/ARMv8-M a
 numeric constant uses `movw`/`movt` instead of a literal (four bytes to 16

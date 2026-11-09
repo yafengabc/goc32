@@ -217,6 +217,7 @@ func run(o options) error {
 		if err != nil {
 			return fmt.Errorf("%s: IR parse: %w", o.inputs[0], err)
 		}
+		// The IR file may be one part of a larger link, so leave it alone.
 		var asm string
 		if t.Arch == "arm" {
 			asm, err = native32.EmitARM(m, t.CPU)
@@ -260,7 +261,7 @@ func run(o options) error {
 					out = filepath.Join(o.out, filepath.Base(out))
 				}
 			}
-			if err := compileOne(src, out, t, incs, defs, o); err != nil {
+			if err := compileOne(src, out, t, incs, defs, o, 0); err != nil {
 				return err
 			}
 		}
@@ -293,19 +294,25 @@ func run(o options) error {
 		filepath.Join(tos, "user", "syscall.c"),
 	} {
 		obj := filepath.Join(tmp, replaceExt(filepath.Base(src), ".o"))
-		if err := buildObject(src, obj, t, incs, defs, o, shim); err != nil {
+		if err := buildObject(src, obj, t, incs, defs, o, shim, 0); err != nil {
 			return err
 		}
 		addObj(obj)
 	}
-	// The program's own translation units.
+	// The program's own translation units.  Inlining is limited to a single
+	// input: with more than one, a function can be called from a sibling
+	// module, and the local call counts would not see that reference.
+	programInline := 0
+	if len(inputs) == 1 {
+		programInline = inlineLimit(t)
+	}
 	for _, src := range inputs {
 		obj := filepath.Join(tmp, replaceExt(filepath.Base(src), ".o"))
 		// Two inputs with the same base name would collide; make it unique.
 		if _, err := os.Stat(obj); err == nil {
 			obj = filepath.Join(tmp, fmt.Sprintf("%d_%s", len(objs), replaceExt(filepath.Base(src), ".o")))
 		}
-		if err := buildObject(src, obj, t, incs, defs, o, shim); err != nil {
+		if err := buildObject(src, obj, t, incs, defs, o, shim, programInline); err != nil {
 			return err
 		}
 		addObj(obj)
@@ -347,6 +354,21 @@ func run(o options) error {
 	return nil
 }
 
+// inlineLimit is the instruction budget for single-call-site inlining.  It is
+// deliberately small: the stack-machine frame grows when a callee's values are
+// merged into the caller, and on ARMv6-M the extra slots cost more than the
+// removed call.  The pass is also limited to a single input file, where a
+// function cannot be referenced from a sibling translation unit.
+func inlineLimit(t target) int {
+	if t.Arch == "rv32" {
+		return 40
+	}
+	if t.Arch == "arm" && !strings.HasPrefix(t.CPU, "cortex-m0") && !strings.HasPrefix(t.CPU, "cortex-m1") {
+		return 40
+	}
+	return 0
+}
+
 func runtimeDefines(t target, user []string) []string {
 	d := []string{
 		"__builtin_va_list=va_list",
@@ -364,7 +386,7 @@ func runtimeDefines(t target, user []string) []string {
 	return append(d, user...)
 }
 
-func compileOne(src, out string, t target, incs, defs []string, o options) error {
+func compileOne(src, out string, t target, incs, defs []string, o options, inlineLimit int) error {
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		return err
@@ -413,6 +435,9 @@ func compileOne(src, out string, t target, incs, defs []string, o options) error
 	if err != nil {
 		return fmt.Errorf("%s: IR parse: %w", src, err)
 	}
+	if inlineLimit > 0 {
+		native32.InlineSmall(m, inlineLimit)
+	}
 	var asm string
 	if t.Arch == "rv32" {
 		asm, err = native32.EmitRV32(m)
@@ -425,9 +450,9 @@ func compileOne(src, out string, t target, incs, defs []string, o options) error
 	return writeFile(out, []byte(asm))
 }
 
-func buildObject(src, obj string, t target, incs, defs []string, o options, shim string) error {
+func buildObject(src, obj string, t target, incs, defs []string, o options, shim string, inlineLimit int) error {
 	asm := obj[:len(obj)-2] + ".s"
-	if err := compileOne(src, asm, t, incs, defs, o); err != nil {
+	if err := compileOne(src, asm, t, incs, defs, o, inlineLimit); err != nil {
 		return err
 	}
 	return assemble(asm, obj, t, o)
@@ -663,7 +688,7 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
 		if close < 0 {
 			return nil, fmt.Errorf("unterminated inline asm")
 		}
-		// register int r0 __asm__("r0") = ... — a register-binding
+		// register int r0 __asm__("r0") = ... �?a register-binding
 		// declarator, not an asm statement. The back end treats register as a
 		// no-op, so drop the binding and let normal allocation happen.
 		if !volatileSeen && len(out) > 0 && out[len(out)-1].Kind == frontend.TIdent {
