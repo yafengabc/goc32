@@ -186,7 +186,9 @@ storing it to the stack frame and reloading it for the branch; a `xor 1`
 around that comparison becomes the inverted branch.  The text pass also folds
 the register copies left by the slot cache into the consuming `cmp`/store, and
 turns `movs rX, #imm; cmp rD, rX` / `adds rD, rN, rX` into the immediate forms
-when the scratch register is dead afterwards.
+when the scratch register is dead afterwards.  Empty blocks that contain only
+a `b` are threaded away on ARMv7-M/ARMv8-M, where a branch can reach any point
+in the function; a block that can be entered by fallthrough is kept.
 The cache keeps word-sized `str/ldr [sp,#off]` pairs within a block, so a
 value stored and read again becomes a register move (or disappears); word
 stores that no surviving load reads are deleted, except the outgoing stack
@@ -204,7 +206,7 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 27,080 bytes / 16,942 compressed on the
+literal pools.  ARM `sh` is now 26,216 bytes / 16,892 compressed on the
 Cortex-M3 target and 31,852 / 17,755 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 

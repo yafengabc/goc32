@@ -24,7 +24,7 @@ var armInvert = map[string]string{
 }
 
 func armPeephole(src string, wide bool) string {
-	return armJumpPeephole(armFoldMoves(armSlotForward(armShrinkTrampolines(src, wide)), wide))
+	return armJumpPeephole(armFoldMoves(armSlotForward(armThreadBlocks(armShrinkTrampolines(src, wide), wide)), wide))
 }
 
 var armWordSp = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
