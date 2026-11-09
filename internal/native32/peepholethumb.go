@@ -31,7 +31,9 @@ var armWordSp = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-
 
 var armSizeSp = regexp.MustCompile(`^((?:ldrb|ldrh|ldrsb|ldrsh)) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
 
+var armMovsImmRe = regexp.MustCompile(`^movs (r(?:[0-9]|1[0-2])), #(-?[0-9]+)$`)
 var armMovRe = regexp.MustCompile(`^mov (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
+var armAlu3Re = regexp.MustCompile(`^(adds|subs) (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
 var armCmpRe = regexp.MustCompile(`^cmp (r(?:[0-9]|1[0-2])), (#-?[0-9]+|r(?:[0-9]|1[0-2]))$`)
 var armStrOpRe = regexp.MustCompile(`^(str|strb|strh) (r(?:[0-9]|1[0-2])), (.+)$`)
 var armAddR4 = regexp.MustCompile(`^add r4, sp, #(-?[0-9]+)$`)
@@ -96,8 +98,44 @@ func armHasReg(s, reg string) bool {
 	return false
 }
 
-// armReadBeforeWrite is conservative: a destination that also reads itself
-// counts as a read, so a move may be kept longer than necessary, never shorter.
+// armReadsReg reports whether an instruction reads reg as a source.  A
+// two-operand ALU form reads its destination; mov/load/shift-extend forms and
+// three-operand ALU forms only write it.
+func armReadsReg(body, reg string) bool {
+	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
+	if len(f) < 2 {
+		return false
+	}
+	op := f[0]
+	ops := f[1:]
+	start := 0
+	destRead := false
+	if !armNoDest[op] && len(ops) > 0 {
+		start = 1
+		if len(ops) == 2 {
+			switch op {
+			case "mov", "movs", "ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "adr",
+				"movw", "movt", "mvn", "mvns", "rev", "rev16", "revsh",
+				"uxtb", "uxth", "sxtb", "sxth", "ldr.w":
+				destRead = false
+			default:
+				destRead = true
+			}
+		}
+	}
+	if destRead && strings.TrimSuffix(ops[0], ",") == reg {
+		return true
+	}
+	for _, op := range ops[start:] {
+		if strings.TrimSuffix(op, ",") == reg {
+			return true
+		}
+	}
+	return false
+}
+
+// armReadBeforeWrite reports whether reg's current value is needed again in
+// this block.  Volatile registers die at labels and calls.
 func armReadBeforeWrite(lines []string, reg string) bool {
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "\t") {
@@ -114,10 +152,11 @@ func armReadBeforeWrite(lines []string, reg string) bool {
 		if f[0] == "bl" || f[0] == "blx" || f[0] == "bx" || f[0] == "b" || f[0] == "pop" || armInvert[f[0]] != "" {
 			return false
 		}
-		for _, tok := range strings.Fields(strings.ReplaceAll(body, ",", " "))[1:] {
-			if tok == reg {
-				return true
-			}
+		if armReadsReg(body, reg) {
+			return true
+		}
+		if armWrites(body) == reg {
+			return false
 		}
 	}
 	return false
@@ -133,6 +172,26 @@ func armFoldMoves(src string, wide bool) string {
 		line := lines[i]
 		body := armStripComment(strings.TrimSpace(line))
 		if strings.HasPrefix(line, "\t") {
+			if m := armMovsImmRe.FindStringSubmatch(body); m != nil {
+				reg := m[1]
+				imm, _ := strconv.Atoi(m[2])
+				if armVolatile(reg) && i+1 < len(lines) && strings.HasPrefix(lines[i+1], "\t") &&
+					!armReadBeforeWrite(lines[i+2:], reg) {
+					nb := armStripComment(strings.TrimSpace(lines[i+1]))
+					if m2 := armCmpRe.FindStringSubmatch(nb); m2 != nil && m2[1] != reg && m2[2] == reg &&
+						imm >= 0 && imm <= 255 {
+						out = append(out, "\tcmp "+m2[1]+", #"+strconv.Itoa(imm))
+						i++
+						continue
+					}
+					if m3 := armAlu3Re.FindStringSubmatch(nb); m3 != nil && m3[4] == reg &&
+						imm >= 0 && imm <= 7 {
+						out = append(out, "\t"+m3[1]+" "+m3[2]+", "+m3[3]+", #"+strconv.Itoa(imm))
+						i++
+						continue
+					}
+				}
+			}
 			if m := armMovRe.FindStringSubmatch(body); m != nil {
 				rd, rs := m[1], m[2]
 				if rd == rs {

@@ -121,3 +121,30 @@ func TestArmSlotForwardR4(t *testing.T) {
 		t.Fatalf("armSlotForward r4:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestArmFoldImmediates(t *testing.T) {
+	in := []string{
+		"f:",
+		"\tmovs r1, #7",
+		"\tadds r0, r5, r1",
+		"\tmovs r1, #0",
+		"\tcmp r7, r1",
+		"\tmovs r1, #9",
+		"\tcmp r7, r1",
+		"\tmovs r1, #300",
+		"\tcmp r8, r1",
+		"\tret",
+	}
+	want := []string{
+		"f:",
+		"\tadds r0, r5, #7",
+		"\tcmp r7, #0",
+		"\tcmp r7, #9",
+		"\tmovs r1, #300",
+		"\tcmp r8, r1",
+		"\tret",
+	}
+	if got := strings.Split(armFoldMoves(strings.Join(in, "\n"), true), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("armFoldMoves immediates:\n got %q\nwant %q", got, want)
+	}
+}

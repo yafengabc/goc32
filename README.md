@@ -184,7 +184,9 @@ a pool.  A comparison whose result is used only by a branch is emitted as a
 direct `cmp` + conditional branch instead of materialising a 0/1 value,
 storing it to the stack frame and reloading it for the branch; a `xor 1`
 around that comparison becomes the inverted branch.  The text pass also folds
-the register copies left by the slot cache into the consuming `cmp`/store.
+the register copies left by the slot cache into the consuming `cmp`/store, and
+turns `movs rX, #imm; cmp rD, rX` / `adds rD, rN, rX` into the immediate forms
+when the scratch register is dead afterwards.
 The cache keeps word-sized `str/ldr [sp,#off]` pairs within a block, so a
 value stored and read again becomes a register move (or disappears); word
 stores that no surviving load reads are deleted, except the outgoing stack
@@ -202,8 +204,8 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 27,912 bytes / 17,111 compressed on the
-Cortex-M3 target and 32,748 / 17,872 for the RP2040, down from 72 KB / 84 KB
+literal pools.  ARM `sh` is now 27,080 bytes / 16,942 compressed on the
+Cortex-M3 target and 31,852 / 17,755 for the RP2040, down from 72 KB / 84 KB
 before the trampoline rewrite and 199 KB originally.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
