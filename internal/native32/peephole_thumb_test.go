@@ -62,3 +62,31 @@ func TestArmDeadStoreDelete(t *testing.T) {
 		t.Fatalf("armSlotForward dead stores:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestArmFoldMoves(t *testing.T) {
+	in := []string{
+		"f:",
+		"\tmov r0, r4",
+		"\tcmp r0, #0",
+		"\tbne L",
+		"\tmov r1, r5",
+		"\tstr r1, [sp, #8]",
+		"\tmov r2, r2",
+		"\tret",
+	}
+	want := []string{
+		"f:",
+		"\tcmp r4, #0",
+		"\tbne L",
+		"\tstr r5, [sp, #8]",
+		"\tret",
+	}
+	if got := strings.Split(armFoldMoves(strings.Join(in, "\n"), true), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("armFoldMoves:\n got %q\nwant %q", got, want)
+	}
+	// A copy whose destination is still read after the store must stay.
+	keep := []string{"\tmov r1, r5", "\tstr r1, [sp, #8]", "\tmov r0, r1", "\tret"}
+	if got := strings.Split(armFoldMoves(strings.Join(keep, "\n"), true), "\n"); len(got) != 4 {
+		t.Fatalf("live copy folded: %q", got)
+	}
+}

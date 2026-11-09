@@ -24,12 +24,16 @@ var armInvert = map[string]string{
 }
 
 func armPeephole(src string, wide bool) string {
-	return armJumpPeephole(armSlotForward(armShrinkTrampolines(src, wide)))
+	return armJumpPeephole(armFoldMoves(armSlotForward(armShrinkTrampolines(src, wide)), wide))
 }
 
 var armWordSp = regexp.MustCompile(`^(str|ldr) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
 
 var armSizeSp = regexp.MustCompile(`^((?:ldrb|ldrh|ldrsb|ldrsh)) (r(?:[0-9]|1[0-2])), \[sp(?:, #(-?[0-9]+))?\]$`)
+
+var armMovRe = regexp.MustCompile(`^mov (r(?:[0-9]|1[0-2])), (r(?:[0-9]|1[0-2]))$`)
+var armCmpRe = regexp.MustCompile(`^cmp (r(?:[0-9]|1[0-2])), (#-?[0-9]+|r(?:[0-9]|1[0-2]))$`)
+var armStrOpRe = regexp.MustCompile(`^(str|strb|strh) (r(?:[0-9]|1[0-2])), (.+)$`)
 
 func armStripComment(s string) string {
 	if i := strings.IndexByte(s, '@'); i >= 0 {
@@ -58,6 +62,99 @@ func armWrites(body string) string {
 		return ""
 	}
 	return reg
+}
+
+// armVolatile reports a register that is dead at labels and clobbered by
+// calls.  The emitter keeps function-wide variables only in r5-r11.
+func armVolatile(reg string) bool {
+	switch reg {
+	case "r0", "r1", "r2", "r3", "r12":
+		return true
+	}
+	return false
+}
+
+func armLow(reg string) bool {
+	return len(reg) == 2 && reg[0] == 'r' && reg[1] >= '0' && reg[1] <= '7'
+}
+
+func armHasReg(s, reg string) bool {
+	for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	}) {
+		if tok == reg {
+			return true
+		}
+	}
+	return false
+}
+
+// armReadBeforeWrite is conservative: a destination that also reads itself
+// counts as a read, so a move may be kept longer than necessary, never shorter.
+func armReadBeforeWrite(lines []string, reg string) bool {
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "\t") {
+			return false
+		}
+		body := armStripComment(strings.TrimSpace(line))
+		if body == "" {
+			continue
+		}
+		f := strings.Fields(body)
+		if len(f) == 0 {
+			continue
+		}
+		if f[0] == "bl" || f[0] == "blx" || f[0] == "bx" || f[0] == "b" || f[0] == "pop" || armInvert[f[0]] != "" {
+			return false
+		}
+		for _, tok := range strings.Fields(strings.ReplaceAll(body, ",", " "))[1:] {
+			if tok == reg {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// armFoldMoves folds the register copies introduced by slot forwarding (and
+// by the emitter) into the next comparison or store when the copy destination
+// is a scratch register that is dead afterwards.
+func armFoldMoves(src string, wide bool) string {
+	lines := strings.Split(src, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		body := armStripComment(strings.TrimSpace(line))
+		if strings.HasPrefix(line, "\t") {
+			if m := armMovRe.FindStringSubmatch(body); m != nil {
+				rd, rs := m[1], m[2]
+				if rd == rs {
+					continue
+				}
+				if armVolatile(rd) && i+1 < len(lines) && strings.HasPrefix(lines[i+1], "\t") &&
+					!armReadBeforeWrite(lines[i+2:], rd) {
+					nb := armStripComment(strings.TrimSpace(lines[i+1]))
+					if m2 := armCmpRe.FindStringSubmatch(nb); m2 != nil && m2[1] == rd && m2[2] != rd {
+						out = append(out, "\tcmp "+rs+", "+m2[2])
+						i++
+						continue
+					}
+					if m3 := armStrOpRe.FindStringSubmatch(nb); m3 != nil && m3[2] == rd &&
+						!armHasReg(m3[3], rd) && (wide || armLow(rs)) {
+						nl := "\t" + m3[1] + " " + rs + ", " + m3[3]
+						if strings.Contains(lines[i+1], "@") {
+							nl += " " + lines[i+1][strings.Index(lines[i+1], "@"):]
+						}
+						out = append(out, nl)
+						i++
+						continue
+					}
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // armSlotForward tracks word-sized sp-relative stores within a basic block and

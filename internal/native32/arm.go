@@ -41,8 +41,13 @@ type arm struct {
 	seq      int
 	v6m      bool
 	wide     bool
-	brCond   map[string]*Inst
+	brCond   map[string]armBranch
 	skipCmp  map[*Inst]bool
+}
+
+type armBranch struct {
+	cmp *Inst
+	neg bool
 }
 
 func EmitARM(m *Module, cpu string) (string, error) {
@@ -669,6 +674,11 @@ func (e *arm) loadPair(v Value, lo, hi string) error {
 }
 
 func (e *arm) emitInst(in *Inst) error {
+	// A comparison (and the xor that negates it) consumed directly by a
+	// branch is emitted at the branch; do not materialise a boolean slot.
+	if e.skipCmp[in] {
+		return nil
+	}
 	switch in.Op {
 	case "alloca":
 		if e.direct[in.Dst] {
@@ -808,9 +818,6 @@ func (e *arm) emitInst(in *Inst) error {
 		"shl", "lshr", "ashr", "and", "or", "xor":
 		return e.emitBin(in)
 	case "icmp":
-		if e.skipCmp[in] {
-			return nil
-		}
 		return e.emitICmp(in)
 	case "br":
 		return e.emitBr(in)
@@ -1297,8 +1304,9 @@ func invCond(c string) string {
 // planBranchConds finds comparison results whose only consumer is a branch in
 // the same block.  Such an icmp never needs to materialise a 0/1 value: the
 // branch can compare its operands directly, which also removes the store and
-// reload of the boolean slot.
-func planBranchConds(f *Func) (map[string]*Inst, map[*Inst]bool) {
+// reload of the boolean slot.  A `xor icmp, 1` (the front end's boolean NOT)
+// is folded into an inverted branch as well.
+func planBranchConds(f *Func) (map[string]armBranch, map[*Inst]bool) {
 	def := map[string]*Inst{}
 	blockOf := map[string]int{}
 	uses := map[string]int{}
@@ -1323,21 +1331,52 @@ func planBranchConds(f *Func) (map[string]*Inst, map[*Inst]bool) {
 			}
 		}
 	}
-	byName := map[string]*Inst{}
+	byName := map[string]armBranch{}
 	skip := map[*Inst]bool{}
+	usable := func(name string, bi int) *Inst {
+		d := def[name]
+		if d == nil || d.Op != "icmp" || d.Ty == nil || d.Ty.Size() > 4 ||
+			uses[name] != 1 || blockOf[name] != bi {
+			return nil
+		}
+		return d
+	}
 	for bi, blk := range f.Blocks {
 		for _, in := range blk.Insts {
 			if in.Op != "br" || len(in.Labels) != 2 || len(in.Ops) == 0 || in.Ops[0].Kind != VLocal {
 				continue
 			}
 			name := in.Ops[0].Name
-			d := def[name]
-			if d == nil || d.Op != "icmp" || d.Ty == nil || d.Ty.Size() > 4 ||
-				uses[name] != 1 || blockOf[name] != bi {
+			if d := usable(name, bi); d != nil {
+				byName[name] = armBranch{cmp: d}
+				skip[d] = true
 				continue
 			}
-			byName[name] = d
+			d := def[name]
+			if d == nil || d.Op != "xor" || len(d.Ops) != 2 || uses[name] != 1 || blockOf[name] != bi {
+				continue
+			}
+			var cand *Inst
+			for k := 0; k < 2; k++ {
+				v := d.Ops[k]
+				isOne := (v.Kind == VInt || v.Kind == VBool) && (v.I == 1 || v.U&1 == 1)
+				if !isOne {
+					continue
+				}
+				other := d.Ops[1-k]
+				if other.Kind != VLocal {
+					continue
+				}
+				if c := usable(other.Name, bi); c != nil {
+					cand = c
+				}
+			}
+			if cand == nil {
+				continue
+			}
+			byName[name] = armBranch{cmp: cand, neg: true}
 			skip[d] = true
+			skip[cand] = true
 		}
 	}
 	return byName, skip
@@ -1369,7 +1408,7 @@ func armCond(pred string) (string, bool) {
 	return "", false
 }
 
-func (e *arm) emitBrCmp(in, cmp *Inst) error {
+func (e *arm) emitBrCmp(in, cmp *Inst, neg bool) error {
 	if len(cmp.Ops) != 2 {
 		return fmt.Errorf("icmp with %d operands", len(cmp.Ops))
 	}
@@ -1384,6 +1423,9 @@ func (e *arm) emitBrCmp(in, cmp *Inst) error {
 	cond, ok := armCond(cmp.Pred)
 	if !ok {
 		return fmt.Errorf("unsupported icmp predicate %s", cmp.Pred)
+	}
+	if neg {
+		cond = invCond(cond)
 	}
 	tr := e.newLabel()
 	e.line("cmp %s, %s", rA, rB)
@@ -1409,8 +1451,8 @@ func (e *arm) emitBr(in *Inst) error {
 		return nil
 	}
 	if len(in.Ops) > 0 && in.Ops[0].Kind == VLocal {
-		if d := e.brCond[in.Ops[0].Name]; d != nil {
-			return e.emitBrCmp(in, d)
+		if b, ok := e.brCond[in.Ops[0].Name]; ok {
+			return e.emitBrCmp(in, b.cmp, b.neg)
 		}
 	}
 	cond, err := e.loadValTo(in.Ops[0], "r0")
