@@ -93,24 +93,25 @@ All 37 programs under `user/` compile and link for RV32. 36/37 do so for ARM;
 
 ## Code size
 
-The back end is a stack machine: every SSA value gets a frame slot and no
-optimisation runs, so images are larger than clang's. Measured over all 37
-`user/*.c` programs (RV32IMC, `-O2` clang baseline from `build/fs-stage/bin`):
+The back end is mostly a stack machine: SSA values normally get a frame slot,
+with a small block-local register allocator layered on top.  Measured over all
+37 `user/*.c` programs (RV32IMC, `-O2` clang baseline from
+`build/fs-stage/bin`):
 
 | | goc32 | clang | ratio |
 |---|---:|---:|---:|
-| raw ELF total | 135,100 | 87,630 | 1.54x |
-| LZ4TOS total | 97,039 | 66,850 | 1.45x |
+| raw ELF total | 132,892 | 87,630 | 1.52x |
+| LZ4TOS total | 95,894 | 66,850 | 1.43x |
 
 Examples (raw ELF / LZ4TOS):
 
 | program | goc32 | clang |
 |---|---:|---:|
-| `hello` | 1,560 / 1,116 | 998 / 724 |
-| `hello_printf` | 2,708 / 1,933 | 1,606 / 1,202 |
-| `reloc` | 2,040 / 1,438 | 1,142 / 856 |
-| `wheap` | 3,496 / 2,551 | 1,974 / 1,550 |
-| `sh` | 21,796 / 14,823 | 16,054 / 12,589 |
+| `hello` | 1,560 / 1,112 | 998 / 724 |
+| `hello_printf` | 2,644 / 1,905 | 1,606 / 1,202 |
+| `reloc` | 2,040 / 1,440 | 1,142 / 856 |
+| `wheap` | 3,400 / 2,492 | 1,974 / 1,550 |
+| `sh` | 21,444 / 14,676 | 16,054 / 12,589 |
 
 The first measurement was 4.94x raw / 3.94x compressed.  The biggest wins
 after the peephole were:
@@ -130,6 +131,14 @@ after the peephole were:
 - a parameter whose only use is the initial store to a direct local is written
   straight from its incoming argument register in the prologue, and the store
   instruction disappears;
+- a value whose live range stays inside one basic block with no call is
+  allocated to a caller-saved register (`a0-a3`, falling back to `a6`/`a7`),
+  and the producer writes that register directly, so the value never gets a
+  frame slot.  Caller-saved registers need no prologue save.  A value is only
+  allocated when some use would otherwise need a copy out of `q0`; a value
+  that every use can read from the scratch register is left in place.
+  Values crossing a block, allocas, phi destinations and blocks containing a
+  call keep their slots;
 - a call result consumed by the next instruction stays in `a0` instead of
   taking the stack round trip, and memory stores use an already-live value or
   pointer register directly;
@@ -240,9 +249,10 @@ tinyos/goc/             usys.h shim + __tos_syscall for ecall/svc
 
 The back ends cover the integer/pointer/array/struct/function/variadic subset
 used by `user/lib.c` and the small user programs. Floating point, `long double`,
-atomics, TLS and inline asm are not implemented yet. Values live in frame slots
-(a stack machine); the local peephole and slot reuse above shrink the output,
-but there is no register allocator, so correctness and size still come before
+atomics, TLS and inline asm are not implemented yet. Values normally live in
+frame slots (a stack machine); the local peephole, slot reuse and the RV32
+block-local register allocator above shrink the output, but there is no
+function-wide register allocator, so correctness and size still come before
 speed.
 
 `rp2040` emits the ARMv6-M subset; `arm` (Cortex-M3) and `rp2350` (Cortex-M33)
