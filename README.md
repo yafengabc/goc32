@@ -234,9 +234,14 @@ ARMv6-M).  What remains is inherent to Thumb-1: 3,929 of `sh`'s 4,850
 sp-relative accesses need the 32-bit `ldr/str` form because the frame offset
 is past 124, two-operand ALU operations need a setting `movs`, ARMv6-M can
 hold register variables only in `r5-r7`, and constants/symbol addresses use
-literal pools.  ARM `sh` is now 25,832 bytes / 16,755 compressed on the
+literal pools.  ARM `sh` is now 25,800 bytes / 16,721 compressed on the
 Cortex-M3 target and 30,460 / 17,563 for the RP2040, down from 72 KB / 84 KB
-before the trampoline rewrite and 199 KB originally.
+before the trampoline rewrite and 199 KB originally.  On ARMv7-M/ARMv8-M a
+numeric constant uses `movw`/`movt` instead of a literal (four bytes to 16
+bits, eight above, and no pool pressure); a block-end forward pool for
+ARMv6-M was measured as well, and although it cut about 2 KB of raw text it
+compressed worse than the inline `ldr`/word pairs, so ARMv6-M keeps the
+inline form.
 
 The frame is the other visible cost. `deep.c` deliberately overflows the 8 KiB
 default stack and relies on the kernel doubling it once.  After the slot

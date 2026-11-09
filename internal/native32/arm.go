@@ -652,6 +652,19 @@ func (e *arm) li(reg string, v uint64) {
 		e.line("lsls %s, %s, #%d", reg, reg, sh)
 		return
 	}
+	// Thumb-2 has MOVW/MOVT, which build a 32-bit constant without touching
+	// the literal pool: four bytes up to 16 bits, eight bytes above that
+	// (the same as an ldr plus its pool word, but no pool pressure).  Thumb-1
+	// has neither, so those targets keep the literal.
+	if e.wide {
+		if v <= 0xffff {
+			e.line("movw %s, #%d", reg, v)
+			return
+		}
+		e.line("movw %s, #%d", reg, v&0xffff)
+		e.line("movt %s, #%d", reg, (v>>16)&0xffff)
+		return
+	}
 	e.litLoad(reg, fmt.Sprintf("%d", v))
 }
 
