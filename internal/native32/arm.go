@@ -304,7 +304,7 @@ func (e *arm) emitFunc(f *Func) error {
 	}
 
 	e.b.WriteString("\t.section .text." + sanitize(f.Name) + ",\"ax\",%progbits\n")
-	if !strings.HasPrefix(f.Name, ".") {
+	if !f.Private && !strings.HasPrefix(f.Name, ".") {
 		e.b.WriteString("\t.globl " + f.Name + "\n")
 	}
 	e.b.WriteString("\t.type " + f.Name + ",%function\n")

@@ -299,13 +299,11 @@ func run(o options) error {
 		}
 		addObj(obj)
 	}
-	// The program's own translation units.  Inlining is limited to a single
-	// input: with more than one, a function can be called from a sibling
-	// module, and the local call counts would not see that reference.
-	programInline := 0
-	if len(inputs) == 1 {
-		programInline = inlineLimit(t)
-	}
+	// The program's own translation units.  Only C `static` functions reach
+	// the inliner (they are `internal` in the IR), so this is safe even when
+	// several input files are linked together: a sibling module cannot name a
+	// static function from another translation unit.
+	programInline := inlineLimit(t)
 	for _, src := range inputs {
 		obj := filepath.Join(tmp, replaceExt(filepath.Base(src), ".o"))
 		// Two inputs with the same base name would collide; make it unique.

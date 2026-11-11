@@ -5,7 +5,7 @@ import (
 )
 
 const inlineSingleRet = `
-define i32 @add1(i32 %p0) {
+define internal i32 @add1(i32 %p0) {
 entry:
   %v = add i32 %p0, 1
   ret i32 %v
@@ -43,7 +43,7 @@ func TestInlineSingleReturn(t *testing.T) {
 }
 
 const inlineMultiRet = `
-define i32 @pick(i32 %p0) {
+define internal i32 @pick(i32 %p0) {
 entry:
   %c = icmp ne i32 %p0, 0
   br i1 %c, label %yes, label %no
@@ -85,7 +85,7 @@ func TestInlineMultiReturn(t *testing.T) {
 }
 
 const inlineRecursive = `
-define i32 @loop(i32 %p0) {
+define internal i32 @loop(i32 %p0) {
 entry:
   %c = icmp ne i32 %p0, 0
   br i1 %c, label %again, label %done
@@ -114,7 +114,7 @@ func TestInlineSkipsRecursion(t *testing.T) {
 }
 
 const inlineTwoCalls = `
-define i32 @f(i32 %p0) {
+define internal i32 @f(i32 %p0) {
 entry:
   %v = add i32 %p0, 1
   ret i32 %v
@@ -140,7 +140,7 @@ func TestInlineSkipsTwoCallSites(t *testing.T) {
 }
 
 const inlineAddressTaken = `
-define i32 @f(i32 %p0) {
+define internal i32 @f(i32 %p0) {
 entry:
   %v = add i32 %p0, 1
   ret i32 %v
@@ -169,7 +169,7 @@ func TestInlineKeepsAddressTaken(t *testing.T) {
 }
 
 const inlineProtectedIR = `
-define i32 @memcpy(ptr %p0, ptr %p1, i32 %p2) {
+define internal i32 @memcpy(ptr %p0, ptr %p1, i32 %p2) {
 entry:
   ret i32 0
 }
@@ -194,6 +194,33 @@ func TestInlineKeepsBackendHelpers(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("memcpy removed: %v", funcNames(m))
+	}
+}
+
+const inlineExternal = `
+define i32 @helper(i32 %p0) {
+entry:
+  %v = add i32 %p0, 1
+  ret i32 %v
+}
+define i32 @main(i32 %p0, ptr %p1) {
+entry:
+  %r = call i32 @helper(i32 5)
+  ret i32 %r
+}
+`
+
+func TestInlineSkipsExternal(t *testing.T) {
+	m, err := ParseModule(inlineExternal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	InlineSmall(m, 1000)
+	if len(m.Funcs) != 2 {
+		t.Fatalf("external function was inlined or removed: %v", funcNames(m))
+	}
+	if n := countCalls(m, "helper"); n != 1 {
+		t.Fatalf("external call changed: %d", n)
 	}
 }
 

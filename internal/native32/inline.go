@@ -9,11 +9,13 @@ import "fmt"
 // pay a call, a prologue/epilogue and register saves for nothing.  Inlining a
 // function with exactly one call site cannot duplicate code: the body moves to
 // the call site, and the out-of-line copy is dropped once it has no callers and
-// its address is never taken (the linker cannot drop it by itself because the
-// emitter marks every function global).
+// its address is never taken.  Static functions carry internal linkage, so no
+// other translation unit can reference the symbol and the removal is safe.
 //
-// Only direct calls to definitions inside the same module are considered.  A
-// recursive function is skipped, as are variadic functions and helpers the
+// Only direct calls to translation-unit-local definitions inside the same
+// module are considered.  gocl marks C `static` functions `internal`, and that
+// linkage is what makes removal safe: no other object can reference the symbol.
+// Recursive functions are skipped, as are variadic functions and helpers the
 // backend emits calls to directly (`__aeabi_*`, `memcpy`, ...).
 
 func InlineSmall(m *Module, limit int) {
@@ -57,6 +59,12 @@ func (in *irInliner) step() bool {
 				}
 				callee := in.fmap[call.Callee]
 				if callee == nil || len(callee.Blocks) == 0 || callee == caller {
+					continue
+				}
+				// Only a translation-unit-local (C static) function can be
+				// inlined and dropped safely: an external symbol may be
+				// referenced from another object that this module never sees.
+				if !callee.Private {
 					continue
 				}
 				if callee.Variadic || callee.Name == "main" || inlineProtected(callee.Name) {
@@ -180,7 +188,7 @@ func (in *irInliner) removeInlinedAway() {
 	addr := in.addressTaken()
 	keep := map[*Func]bool{}
 	for _, f := range in.m.Funcs {
-		if !in.inlined[f.Name] || f.Name == "main" || inlineProtected(f.Name) || addr[f.Name] || counts[f.Name] > 0 {
+		if !in.inlined[f.Name] || !f.Private || f.Name == "main" || inlineProtected(f.Name) || addr[f.Name] || counts[f.Name] > 0 {
 			keep[f] = true
 		}
 	}

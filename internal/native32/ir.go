@@ -216,6 +216,10 @@ type Func struct {
 	Params   []Param
 	Variadic bool
 	Blocks   []*Block
+	// Private is true for an `internal`/`private` IR definition, which comes
+	// from a C `static` function.  It is safe to inline and remove such a
+	// function: no other translation unit can name it.
+	Private bool
 }
 
 type Block struct {
@@ -809,6 +813,11 @@ func parseFuncHeader(line string) (*Func, error) {
 	}
 	name := line[at+1 : lp]
 	f := &Func{Name: name, Ret: ret}
+	for _, tok := range strings.Fields(line[:at]) {
+		if tok == "internal" || tok == "private" {
+			f.Private = true
+		}
+	}
 	params := strings.TrimSpace(line[lp+1 : rp])
 	if params != "" {
 		for _, p := range splitTop(params) {

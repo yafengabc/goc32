@@ -301,7 +301,7 @@ func (e *rv32) emitFunc(f *Func) error {
 	// ra lives below the vararg save area, so keep the save area at the top
 	// and contiguous with the caller's stack arguments.
 	e.b.WriteString("\t.section .text." + sanitize(f.Name) + ",\"ax\",@progbits\n")
-	if !strings.HasPrefix(f.Name, ".") {
+	if !f.Private && !strings.HasPrefix(f.Name, ".") {
 		e.b.WriteString("\t.globl " + f.Name + "\n")
 	}
 	e.b.WriteString("\t.type " + f.Name + ",@function\n")

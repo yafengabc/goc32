@@ -179,11 +179,13 @@ after the peephole were:
   the Thumb ones;
 - a function called exactly once that is at most 40 IR instructions is inlined
   at that call site, and the out-of-line body is dropped when its address is
-  never taken.  The pass runs only when the program is one input file, so a
-  sibling translation unit cannot reference the removed symbol.  Larger
-  functions stay out of line: the stack-machine frame grows when the callee's
-  values merge into the caller, and that already costs more than the removed
-  call at around 80 instructions.  ARMv6-M is excluded for the same reason;
+  never taken.  gocl emits C `static` functions with `internal` linkage, and
+  only those are candidates: a sibling translation unit cannot reference the
+  removed symbol, so the pass is safe for multi-file programs too (it used to
+  be single-input only).  Larger functions stay out of line: the stack-machine
+  frame grows when the callee's values merge into the caller, and that already
+  costs more than the removed call at around 80 instructions.  ARMv6-M is
+  excluded for the same reason;
 - small RV32 functions keep one slot per value so the peephole can prove stores
   dead per value; frames over 2 KiB use a per-block liveness pool instead.
   Thumb cares more about frame size than about per-value store proof, so it

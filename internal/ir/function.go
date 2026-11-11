@@ -234,7 +234,16 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	// irFuncSym, not f.Name: the definition has to carry the same spelling the
 	// call sites use, and for the two libfuncs LLVM would rewrite that is not
 	// the C name. See llvmMisrecognizedMaxMin.
-	sig := "define " + m.dso() + e.retTy + " @" + irFuncSym(f.Name) + "(" + strings.Join(params, ", ")
+	//
+	// A static function is translation-unit local: mark it `internal` so the
+	// linker may drop the out-of-line copy and, more importantly, so the
+	// backend's inliner can remove it without guessing whether another object
+	// references the symbol.
+	linkage := "define " + m.dso()
+	if f.Storage == "static" {
+		linkage = "define internal "
+	}
+	sig := linkage + e.retTy + " @" + irFuncSym(f.Name) + "(" + strings.Join(params, ", ")
 	if f.Variadic {
 		// The ellipsis is what makes this variadic to LLVM, and it has to come
 		// after every named parameter. A function that takes a fixed count is not
