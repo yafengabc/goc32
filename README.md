@@ -236,8 +236,8 @@ its target there.  A constant that is a byte shifted into place is built with
 `movs` + `lsls` instead of a literal; on ARMv6-M that is 4 bytes rather than
 the 12-byte inline literal block.
 
-A large part of the old Thumb size was the conservative long-branch
-trampoline: every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
+A large part of the old Thumb size was the conservative long-branch veneer
+(trampoline): every unconditional jump used `ldr r3,.LbrN; mov pc,r3;
 .balign 4; .word target`, and `sh` had 1,665 of them (6.6 KiB of words plus
 instructions).  The post-pass now replaces a trampoline with a direct branch
 when its target is in range (always on ARMv7-M/v8-M, line-distance guarded on
