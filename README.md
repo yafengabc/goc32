@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh.md)
+
 # goc32 — TinyOS user-space C compiler (RV32 + Thumb)
 
 `goc32` is a trimmed, libLLVM-free C compiler for TinyOS user programs. It is a
@@ -27,7 +29,7 @@ linker in this milestone; an internal assembler/linker is next.
 .\build.ps1            # -> bin/goc32.exe
 ```
 
-or `bash build32.sh`. Go 1.25+ is required.
+or `bash build.sh`. Go 1.25+ is required.
 
 ## Usage
 
