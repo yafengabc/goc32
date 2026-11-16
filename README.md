@@ -95,10 +95,10 @@ Tested end to end against QEMU:
   child process (`gmsh` ? `ls`, `free`, `ps`);
 - `TOS_STACK`/`TOS_HEAP` notes survive the link (8 KiB/6 KiB test program).
 
-97 of the 132 `user/*.c` builds (each file for RV32 and ARM) go through the
-whole pipeline. The rest stop in the C front end, not in the assembler or
-linker: floating point, GCC extended asm, a few C99 declarations (`const`
-after the type) and `mutex_t`.
+111 of the 132 `user/*.c` builds (each file for RV32 and ARM) go through the
+whole pipeline. The remaining files are the floating-point/soft-float ones,
+the extended-asm ones, and the library translation units that have no `main`
+(`lib.c`, `syscall.c`, `thread.c`, ...), not assembler or linker failures.
 
 ## Known compiler limitations
 
@@ -110,9 +110,9 @@ has been diffed byte-for-byte against clang's assembler. Two limits are worth st
   no branch relaxation into `c.j`/`c.b`, plus inline literal words on ARM. This
   is deliberate: release images and the prebuilt `msh` are built with clang,
   and goc32 is the single-file development loop, so size is not the metric.
-- **front-end gaps**: `const` in some declaration positions, float IR, most
-  GCC extended asm, and a handful of typedefs are rejected before code
-  generation.
+- **front-end gaps**: float IR and most GCC extended asm are rejected before
+  code generation. Declarations in `for` initialisers and empty asm barriers
+  with clobbers now work.
 
 ## Code size
 

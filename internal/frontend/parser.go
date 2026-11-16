@@ -1979,7 +1979,7 @@ func (p *Parser) parseStmt() (Stmt, error) {
 		}
 		var init Stmt
 		if !p.atPunct(";") {
-			if isTypeName(p.cur()) || p.isAutoDeduction() {
+			if isDeclarationStart(p.cur()) || p.isAutoDeduction() {
 				init, err = p.parseDeclaration()
 				if err != nil {
 					return nil, err

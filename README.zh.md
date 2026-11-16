@@ -90,9 +90,9 @@ span/stack/heap 的算法与 `tools/mklfs.c` 完全一致，所以内核能在�
   再启动一次（`gmsh` → `ls`、`free`、`ps`）；
 - `TOS_STACK`/`TOS_HEAP` 的 note 能穿过链接（8 KiB/6 KiB 的测试程序）。
 
-132 次 `user/*.c` 构建（每个源文件各编 RV32 和 ARM）里有 97 次走完整条流水
-线。其余卡在 C 前端，而不是汇编器或链接器：浮点、GCC 扩展 asm、少数 C99 声
-明位置（类型后的 `const`）以及 `mutex_t`。
+132 次 `user/*.c` 构建（每个源文件各编 RV32 和 ARM）里有 111 次走完整条流水
+线。其余是浮点/soft-float、扩展 asm，以及没有 `main` 的库编译单元
+（`lib.c`、`syscall.c`、`thread.c` 等），不是汇编器或链接器的失败。
 
 ## 已知的编译器限制
 
@@ -102,8 +102,8 @@ span/stack/heap 的算法与 `tools/mklfs.c` 完全一致，所以内核能在�
 - **goc32 的目标码比 clang 大**：不发压缩的 RISC-V 指令，也不把分支放松成
   `c.j`/`c.b`，ARM 上还有内联文字池。这是有意的：发布镜像和预编译的 `msh`
   都由 clang 构建，goc32 只负责单文件开发循环，大小不是它的指标。
-- **前端缺口**：部分声明位置的 `const`、浮点 IR、多数 GCC 扩展 asm，以及少
-  数 typedef，在代码生成之前就会被拒绝。
+- **前端缺口**：浮点 IR 和多数 GCC 扩展 asm 在代码生成之前就会被拒绝；`for`
+  初始化里的声明、带 clobber 的空 asm 屏障现在都能过。
 
 ## 代码体积
 

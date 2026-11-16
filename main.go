@@ -639,6 +639,7 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, []string, error) {
 		d := 0
 		close := -1
 		var body strings.Builder
+		seenColon := false
 		for k := open; k < len(toks); k++ {
 			switch toks[k].Text {
 			case "(":
@@ -648,8 +649,14 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, []string, error) {
 				if d == 0 {
 					close = k
 				}
+			case ":":
+				if d == 1 {
+					seenColon = true
+				}
 			}
-			if d == 1 && toks[k].Kind == frontend.TStr {
+			// Only the template is the asm body; after the first ':' come
+			// outputs, inputs and clobbers, which are not assembly text.
+			if d == 1 && !seenColon && toks[k].Kind == frontend.TStr {
 				body.Write(toks[k].Str)
 			}
 			if close >= 0 {
