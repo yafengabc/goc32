@@ -66,19 +66,20 @@ func asmArch(t target) as.Arch {
 }
 
 type options struct {
-	target   string
-	tos      string
-	out      string
-	incs     []string
-	defs     []string
-	asmOnly  bool
-	irOnly   bool
-	preOnly  bool
-	packOnly bool
-	fromIR   bool
-	keep     bool
-	verbose  bool
-	inputs   []string
+	target      string
+	tos         string
+	out         string
+	incs        []string
+	defs        []string
+	asmOnly     bool
+	irOnly      bool
+	preOnly     bool
+	packOnly    bool
+	fromIR      bool
+	keep        bool
+	verbose     bool
+	noBuildDefs bool
+	inputs      []string
 }
 
 func main() {
@@ -118,6 +119,8 @@ func main() {
 			o.keep = true
 		case "-v":
 			o.verbose = true
+		case "-no-build-defines":
+			o.noBuildDefs = true
 		case "-h", "-help", "--help":
 			usage()
 			return
@@ -147,6 +150,8 @@ func usage() {
   -pack          wrap an already linked ELF in LZ4TOS (no compile)
   -ll            treat the input as LLVM IR text and emit assembly
   -keep          keep the temporary build directory
+  -no-build-defines
+                 do not import the -D flags recorded by the last tos build
   -v             print the pipeline steps
 `)
 }
@@ -216,7 +221,7 @@ func run(o options) error {
 		filepath.Join(tos, "kernel"),
 		filepath.Join(tos, "arch", t.Arch),
 	)
-	defs := runtimeDefines(t, o.defs)
+	defs := runtimeDefines(t, append(buildConfigDefines(tos, t.Name, o), o.defs...))
 	arch := asmArch(t)
 
 	if o.asmOnly || o.irOnly || o.preOnly {
@@ -291,6 +296,23 @@ func run(o options) error {
 			return err
 		}
 	}
+	// The optional user-space runtimes follow the same feature defines as
+	// `tos build`: threads add thread.c + thread_switch.S, kernel threads add
+	// kthread.c.  The linker's reachability pass drops them when the program
+	// does not call into them.
+	if hasDefine(defs, "TOS_THREADS") {
+		if err := build(filepath.Join(tos, "user", "thread.c"), 0); err != nil {
+			return err
+		}
+		if err := buildAsm(filepath.Join(tos, "user", "thread_switch.S"), arch, o, defs, &objs); err != nil {
+			return err
+		}
+	}
+	if hasDefine(defs, "TOS_KTHREADS") {
+		if err := build(filepath.Join(tos, "user", "kthread.c"), 0); err != nil {
+			return err
+		}
+	}
 	// The program's own translation units.  Only C `static` functions reach
 	// the inliner (they are `internal` in the IR), so this is safe even when
 	// several input files are linked together: a sibling module cannot name a
@@ -302,10 +324,10 @@ func run(o options) error {
 		}
 	}
 	// crt0, the goc syscall entry, and (ARM only) the EABI helpers.
-	if err := buildAsm(filepath.Join(tos, "user", "crt0_"+t.Arch+".S"), "", arch, o, &objs); err != nil {
+	if err := buildAsm(filepath.Join(tos, "user", "crt0_"+t.Arch+".S"), arch, o, defs, &objs); err != nil {
 		return err
 	}
-	if err := buildAsm(filepath.Join(shim, "syscall_"+t.Arch+".S"), "", arch, o, &objs); err != nil {
+	if err := buildAsm(filepath.Join(shim, "syscall_"+t.Arch+".S"), arch, o, defs, &objs); err != nil {
 		return err
 	}
 	if t.Arch == "arm" {
@@ -336,17 +358,12 @@ func run(o options) error {
 	return nil
 }
 
-func buildAsm(path, text string, arch as.Arch, o options, objs *[]*obj.Object) error {
-	var src []byte
-	if text != "" {
-		src = []byte(text)
-	} else {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		src = b
+func buildAsm(path string, arch as.Arch, o options, defs []string, objs *[]*obj.Object) error {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return err
 	}
+	src = filterAsm(src, defs)
 	if o.verbose {
 		fmt.Printf("  as  %s\n", path)
 	}
@@ -356,6 +373,131 @@ func buildAsm(path, text string, arch as.Arch, o options, objs *[]*obj.Object) e
 	}
 	*objs = append(*objs, ob)
 	return nil
+}
+
+// hasDefine reports whether a NAME or NAME=value define is in the list.
+func hasDefine(defs []string, name string) bool {
+	for _, d := range defs {
+		if d == name || strings.HasPrefix(d, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// filterAsm applies the tiny preprocessor subset the hand-written .S files
+// use: #if/#ifdef/#ifndef/#elif/#else/#endif with defined(NAME), NAME, !, &&
+// and ||.  The C front end's preprocessor is not involved; in particular,
+// user/thread_switch.S picks its architecture this way.
+func filterAsm(src []byte, defs []string) []byte {
+	known := map[string]bool{}
+	for _, d := range defs {
+		name := d
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		known[name] = true
+	}
+	type frame struct {
+		parent, active, taken bool
+	}
+	stack := []frame{{parent: true, active: true}}
+	active := func() bool { return stack[len(stack)-1].active }
+
+	var out strings.Builder
+	for _, line := range strings.Split(string(src), "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "#") {
+			if active() {
+				out.WriteString(line)
+				out.WriteByte('\n')
+			}
+			continue
+		}
+		f := strings.Fields(t)
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "#if", "#ifdef", "#ifndef":
+			cond := false
+			rest := strings.TrimSpace(strings.TrimPrefix(t, f[0]))
+			switch f[0] {
+			case "#ifdef":
+				cond = known[rest]
+			case "#ifndef":
+				cond = !known[rest]
+			default:
+				cond = evalAsmCond(rest, known)
+			}
+			p := active()
+			stack = append(stack, frame{parent: p, active: p && cond, taken: p && cond})
+		case "#elif":
+			if len(stack) == 0 {
+				continue
+			}
+			fr := &stack[len(stack)-1]
+			rest := strings.TrimSpace(strings.TrimPrefix(t, f[0]))
+			if fr.parent && !fr.taken {
+				cond := evalAsmCond(rest, known)
+				fr.active = cond
+				fr.taken = cond
+			} else {
+				fr.active = false
+			}
+		case "#else":
+			if len(stack) == 0 {
+				continue
+			}
+			fr := &stack[len(stack)-1]
+			fr.active = fr.parent && !fr.taken
+			if fr.active {
+				fr.taken = true
+			}
+		case "#endif":
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+	return []byte(out.String())
+}
+
+func evalAsmCond(expr string, known map[string]bool) bool {
+	for _, orPart := range strings.Split(expr, "||") {
+		ok := true
+		for _, andPart := range strings.Split(orPart, "&&") {
+			if !evalAsmTerm(andPart, known) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func evalAsmTerm(term string, known map[string]bool) bool {
+	t := strings.TrimSpace(term)
+	neg := false
+	for strings.HasPrefix(t, "!") {
+		neg = !neg
+		t = strings.TrimSpace(strings.TrimPrefix(t, "!"))
+	}
+	val := false
+	if strings.HasPrefix(t, "defined") {
+		name := strings.TrimSpace(strings.TrimPrefix(t, "defined"))
+		name = strings.Trim(name, "() \t")
+		val = known[name]
+	} else {
+		val = known[t]
+	}
+	if neg {
+		return !val
+	}
+	return val
 }
 
 // inlineLimit is the instruction budget for single-call-site inlining.  It is
@@ -388,6 +530,58 @@ func runtimeDefines(t target, user []string) []string {
 		d = append(d, "__riscv=1")
 	}
 	return append(d, user...)
+}
+
+// buildConfigDefines imports the -D flags `tos build` used for user programs
+// on the same target: TOS_THREADS, TOS_MAILBOX and one TOS_<FEATURE> per
+// enabled menuconfig feature.  build/build-config.txt is written by the build
+// and records that exact list, so goc32 does not have to duplicate the
+// menuconfig-to-macro mapping.
+func buildConfigDefines(tos, target string, o options) []string {
+	if o.noBuildDefs {
+		return nil
+	}
+	// A per-target copy survives a later build for another board; the shared
+	// file is the fallback (and what releases carry).
+	path := filepath.Join(tos, "build", "build-config-"+target+".txt")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		path = filepath.Join(tos, "build", "build-config.txt")
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+	}
+	cfgTarget := ""
+	var defs []string
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "target":
+			cfgTarget = f[1]
+		case "user-defines":
+			for _, d := range f[1:] {
+				d = strings.TrimPrefix(d, "-D")
+				if d != "" {
+					defs = append(defs, d)
+				}
+			}
+		}
+	}
+	if cfgTarget != target {
+		if o.verbose {
+			fmt.Printf("  note: %s was built for %s, not %s; its feature defines are not used\n",
+				path, cfgTarget, target)
+		}
+		return nil
+	}
+	if o.verbose && len(defs) > 0 {
+		fmt.Printf("  -D from %s: %s\n", path, strings.Join(defs, " "))
+	}
+	return defs
 }
 
 // compileOne runs the C front end and the native32 back end and returns the

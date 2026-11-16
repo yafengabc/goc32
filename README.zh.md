@@ -58,6 +58,13 @@ goc32 -target arm     -o build/hello.tos user/hello.c
 `-v`、`-pack`（不编译，只把已链接的 ELF 包进 LZ4TOS）、`-ll`（把输入当作
 LLVM IR 文本并输出汇编）。额外 include/宏：`-I`、`-D`。链接时设
 `GOC32_MAP=1` 会打印每个存活段的名字和地址。
+功能宏跟随构建：`goc32` 会读 `tos build` 留下的
+`build/build-config-<target>.txt`（或共享的 `build-config.txt`），套用同一组
+用户程序宏：`TOS_THREADS`、`TOS_MAILBOX`，以及每个启用的 menuconfig 功能对应
+的 `TOS_<FEATURE>`。有 `TOS_THREADS` 时还会链接 `user/thread.c` 和
+`user/thread_switch.S`；有 `TOS_KTHREADS` 时链接 `user/kthread.c`。`-no-build-defines`
+可以关掉这套导入，只编一个自包含的文件。
+
 
 编译器从输入源文件向上查找 TinyOS 检出目录（找 `user/lib.c`、`user/user.ld`、
 `include/tos.h`）。源码不在检出目录里时用 `-tos DIR` 或 `TOS_ROOT`。

@@ -62,6 +62,14 @@ Diagnostics: `-S` (assembly), `-ir` (gocl IR), `-E` (preprocessed C), `-keep`,
 `-I`, `-D`. `GOC32_MAP=1` prints every live section and its address while
 linking.
 
+Feature defines follow the build. `goc32` reads
+`build/build-config-<target>.txt` (or the shared `build-config.txt`) written by
+`tos build` and applies the same user-program macros: `TOS_THREADS`,
+`TOS_MAILBOX`, and one `TOS_<FEATURE>` per enabled menuconfig feature. With
+`TOS_THREADS` it also links `user/thread.c` and `user/thread_switch.S`; with
+`TOS_KTHREADS` it links `user/kthread.c`. `-no-build-defines` turns that off
+for a self-contained build of one file.
+
 The compiler finds the TinyOS checkout by walking up from the input source (it
 looks for `user/lib.c`, `user/user.ld`, `include/tos.h`). Use `-tos DIR` or
 `TOS_ROOT` when the source is outside a checkout.
