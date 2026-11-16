@@ -112,7 +112,7 @@ span/stack/heap 的算法与 `tools/mklfs.c` 完全一致，所以内核能在�
 ## 代码体积
 
 后端基本是栈式代码生成（stack machine）：SSA 值通常各占一个栈帧槽位，上面再叠一层块内的小寄存器
-分配器。全部 37 个 `user/*.c` 的实测（RV32IMC，`-O2` clang 基线取自
+下面这组数字是对能编过的 `user/*.c` 的实测（RV32IMC，`-O2` clang 基线取自
 `build/fs-stage/bin`）：
 
 | | goc32 | clang | 比值 |
