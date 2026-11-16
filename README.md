@@ -119,9 +119,6 @@ is in the compiler front end or code generator:
   GCC extended asm, and a handful of typedefs are rejected before code
   generation.
 
-All 37 programs under `user/` compile and link for RV32. 36/37 do so for ARM;
-`smp.c` is the exception because it binds GCC register variables to `r0`/`r1`/
-`r2` and issues a raw `svc #0`.
 
 ## Code size
 
