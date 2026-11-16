@@ -104,21 +104,15 @@ after the type) and `mutex_t`.
 
 The assembler and linker are complete for the instruction subset native32
 emits, and every non-branch instruction in the generated RV32/Thumb assembly
-has been diffed byte-for-byte against clang's assembler. What is still missing
-is in the compiler front end or code generator:
+has been diffed byte-for-byte against clang's assembler. Two limits are worth stating:
 
-- **ARM `*s++ = c`**: native32 can lose the old pointer across the post-
-  increment (`msh`'s `split()` does this). `gmsh` then faults on `echo hi`
-  even when the same assembly is assembled and linked by clang, so this is a
-  codegen bug rather than a toolchain one.
 - **goc32 code is larger than clang's**: no compressed RISC-V instructions and
-  no branch relaxation into `c.j`/`c.b`, plus inline literal words on ARM. A
-  goc32-built `msh` needs a 20 KiB window on RV32 (the clang-built image still
-  fits in 16 KiB), which is why releases keep using clang.
+  no branch relaxation into `c.j`/`c.b`, plus inline literal words on ARM. This
+  is deliberate: release images and the prebuilt `msh` are built with clang,
+  and goc32 is the single-file development loop, so size is not the metric.
 - **front-end gaps**: `const` in some declaration positions, float IR, most
   GCC extended asm, and a handful of typedefs are rejected before code
   generation.
-
 
 ## Code size
 

@@ -104,12 +104,14 @@ func armHasReg(s, reg string) bool {
 // two-operand ALU form reads its destination; mov/load/shift-extend forms and
 // three-operand ALU forms only write it.
 func armReadsReg(body, reg string) bool {
-	f := strings.Fields(strings.ReplaceAll(body, ",", " "))
-	if len(f) < 2 {
+	fields := strings.FieldsFunc(body, func(r rune) bool {
+		return r == ',' || r == '[' || r == ']' || r == ' ' || r == '\t'
+	})
+	if len(fields) < 2 {
 		return false
 	}
-	op := f[0]
-	ops := f[1:]
+	op := fields[0]
+	ops := fields[1:]
 	start := 0
 	destRead := false
 	if !armNoDest[op] && len(ops) > 0 {

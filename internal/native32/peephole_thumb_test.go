@@ -174,3 +174,52 @@ func TestArmFoldMovesConsumers(t *testing.T) {
 		t.Fatalf("armFoldMoves consumers:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestArmReadsRegSeesMemoryOperands(t *testing.T) {
+	cases := []struct {
+		body string
+		reg  string
+		want bool
+	}{
+		{"strb r0, [r1]", "r1", true},
+		{"str r0, [r1, #4]", "r1", true},
+		{"ldrb r0, [r1, #3]", "r1", true},
+		{"ldr r1, [r0]", "r1", false},
+		{"ldr r1, [sp, #8]", "r1", false},
+		{"movs r0, #0", "r0", false},
+	}
+	for _, c := range cases {
+		if got := armReadsReg(c.body, c.reg); got != c.want {
+			t.Errorf("armReadsReg(%q, %q) = %v, want %v", c.body, c.reg, got, c.want)
+		}
+	}
+}
+
+// A move folded into a store must stay if the source register is still the
+// store address later.  This is the msh split() shape: the old string pointer
+// is copied to r1, stored to a slot, and read back for `*s++ = 0`; rewriting
+// `str r1, [sp,#68]` to `str r5, [sp,#68]` and deleting `mov r1, r5` leaves
+// `strb r0, [r1]` pointing at a stale character.
+func TestArmFoldMovesKeepsAddressUsedLater(t *testing.T) {
+	in := []string{
+		"f:",
+		"	mov r1, r5",
+		"	str r1, [sp, #68]",
+		"	ldr r0, [sp, #72]",
+		"	movs r0, #0",
+		"	strb r0, [r1]",
+		"	ret",
+	}
+	want := []string{
+		"f:",
+		"	mov r1, r5",
+		"	str r1, [sp, #68]",
+		"	ldr r0, [sp, #72]",
+		"	movs r0, #0",
+		"	strb r0, [r1]",
+		"	ret",
+	}
+	if got := strings.Split(armFoldMoves(strings.Join(in, "\n"), true), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("armFoldMoves address:\n got %q\nwant %q", got, want)
+	}
+}
