@@ -2,12 +2,12 @@ package main
 
 // goc32 builds one TinyOS user program in one step:
 //
-//   C -> goc front end -> gocl IR text -> native32 asm -> clang -> ld.lld
+//   C -> goc front end -> gocl IR text -> native32 asm -> goc32/as -> goc32/ld
 //     -> LZ4TOS envelope
 //
-// The result is the same hinted LZ4TOS blob `tos build` would place in
-// littlefs. No libLLVM.dll and no cgo are involved; clang/ld.lld are used only
-// as the assembler and linker for this milestone.
+// Everything after the C front end is in this repository: there is no clang,
+// no ld.lld, no libLLVM and no cgo in the path. The result is the same hinted
+// LZ4TOS blob `tos build` would place in littlefs.
 //
 // Examples:
 //   goc32 user/hello.c
@@ -19,14 +19,16 @@ import (
 	"embed"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"goc/common"
 	"goc/frontend"
+	"goc32/internal/as"
+	"goc32/internal/ld"
 	"goc32/internal/lz4tos"
+	"goc32/internal/obj"
 	"gocl"
 	"native32"
 )
@@ -35,53 +37,32 @@ import (
 var shimFS embed.FS
 
 type target struct {
-	Name      string
-	Arch      string // rv32 | arm
-	IRArch    string // riscv32 | armel
-	Triple    string
-	CPU       string
-	ArchFlags []string
-	Emulation string
-	TextReloc bool
+	Name   string
+	Arch   string // rv32 | arm
+	IRArch string // riscv32 | armel
+	CPU    string // cortex-m0plus / cortex-m3 / cortex-m33
 }
 
 var targets = map[string]target{
-	"rv32": {
-		Name: "rv32", Arch: "rv32", IRArch: "riscv32",
-		Triple:    "riscv32-unknown-elf",
-		ArchFlags: []string{"-march=rv32imc", "-mabi=ilp32"},
-		Emulation: "elf32lriscv",
-	},
-	"esp32c3": {
-		Name: "esp32c3", Arch: "rv32", IRArch: "riscv32",
-		Triple:    "riscv32-unknown-elf",
-		ArchFlags: []string{"-march=rv32imc", "-mabi=ilp32"},
-		Emulation: "elf32lriscv",
-	},
-	"rv32nc": {
-		Name: "rv32nc", Arch: "rv32", IRArch: "riscv32",
-		Triple:    "riscv32-unknown-elf",
-		ArchFlags: []string{"-march=rv32im", "-mabi=ilp32"},
-		Emulation: "elf32lriscv",
-	},
-	"arm": {
-		Name: "arm", Arch: "arm", IRArch: "armel",
-		Triple: "thumbv7m-none-eabi", CPU: "cortex-m3",
-		ArchFlags: []string{"-mcpu=cortex-m3", "-mfloat-abi=soft", "-mthumb"},
-		Emulation: "armelf", TextReloc: true,
-	},
-	"rp2040": {
-		Name: "rp2040", Arch: "arm", IRArch: "armel",
-		Triple: "thumbv6m-none-eabi", CPU: "cortex-m0plus",
-		ArchFlags: []string{"-mcpu=cortex-m0plus", "-mfloat-abi=soft", "-mthumb"},
-		Emulation: "armelf", TextReloc: true,
-	},
-	"rp2350": {
-		Name: "rp2350", Arch: "arm", IRArch: "armel",
-		Triple: "thumbv8m.main-none-eabi", CPU: "cortex-m33",
-		ArchFlags: []string{"-mcpu=cortex-m33", "-mfloat-abi=soft", "-mthumb"},
-		Emulation: "armelf", TextReloc: true,
-	},
+	"rv32":    {Name: "rv32", Arch: "rv32", IRArch: "riscv32"},
+	"esp32c3": {Name: "esp32c3", Arch: "rv32", IRArch: "riscv32"},
+	"rv32nc":  {Name: "rv32nc", Arch: "rv32", IRArch: "riscv32"},
+	"arm":     {Name: "arm", Arch: "arm", IRArch: "armel", CPU: "cortex-m3"},
+	"rp2040":  {Name: "rp2040", Arch: "arm", IRArch: "armel", CPU: "cortex-m0plus"},
+	"rp2350":  {Name: "rp2350", Arch: "arm", IRArch: "armel", CPU: "cortex-m33"},
+}
+
+// asmArch maps a TinyOS target to the instruction set and the encodings its
+// core can execute.  The RP2040's Cortex-M0+ has only 16-bit Thumb, so a long
+// branch there is an error rather than a silently widened instruction.
+func asmArch(t target) as.Arch {
+	if t.Arch == "rv32" {
+		return as.RV32
+	}
+	if strings.HasPrefix(t.CPU, "cortex-m0") || strings.HasPrefix(t.CPU, "cortex-m1") {
+		return as.Thumb1
+	}
+	return as.Thumb2
 }
 
 type options struct {
@@ -97,13 +78,11 @@ type options struct {
 	fromIR   bool
 	keep     bool
 	verbose  bool
-	cc       string
-	ld       string
 	inputs   []string
 }
 
 func main() {
-	o := options{target: "rv32", cc: "clang", ld: "ld.lld"}
+	o := options{target: "rv32"}
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -139,10 +118,6 @@ func main() {
 			o.keep = true
 		case "-v":
 			o.verbose = true
-		case "-cc":
-			o.cc = val()
-		case "-ld":
-			o.ld = val()
 		case "-h", "-help", "--help":
 			usage()
 			return
@@ -172,9 +147,7 @@ func usage() {
   -pack          wrap an already linked ELF in LZ4TOS (no compile)
   -ll            treat the input as LLVM IR text and emit assembly
   -keep          keep the temporary build directory
-  -cc PATH       clang path (default: clang)
-  -ld PATH       ld.lld path (default: ld.lld)
-  -v             print every external command
+  -v             print the pipeline steps
 `)
 }
 
@@ -217,17 +190,16 @@ func run(o options) error {
 		if err != nil {
 			return fmt.Errorf("%s: IR parse: %w", o.inputs[0], err)
 		}
-		// The IR file may be one part of a larger link, so leave it alone.
-		var asm string
+		var asmText string
 		if t.Arch == "arm" {
-			asm, err = native32.EmitARM(m, t.CPU)
+			asmText, err = native32.EmitARM(m, t.CPU)
 		} else {
-			asm, err = native32.EmitRV32(m)
+			asmText, err = native32.EmitRV32(m)
 		}
 		if err != nil {
 			return err
 		}
-		return writeFile(outputPath(o.out, o.inputs[0], ".s"), []byte(asm))
+		return writeFile(outputPath(o.out, o.inputs[0], ".s"), []byte(asmText))
 	}
 	tos, err := findTOS(o.tos, o.inputs[0])
 	if err != nil {
@@ -245,6 +217,7 @@ func run(o options) error {
 		filepath.Join(tos, "arch", t.Arch),
 	)
 	defs := runtimeDefines(t, o.defs)
+	arch := asmArch(t)
 
 	if o.asmOnly || o.irOnly || o.preOnly {
 		for _, src := range inputs {
@@ -261,7 +234,11 @@ func run(o options) error {
 					out = filepath.Join(o.out, filepath.Base(out))
 				}
 			}
-			if err := compileOne(src, out, t, incs, defs, o, 0); err != nil {
+			text, err := compileOne(src, t, incs, defs, o, 0)
+			if err != nil {
+				return err
+			}
+			if err := writeFile(out, []byte(text)); err != nil {
 				return err
 			}
 		}
@@ -285,19 +262,34 @@ func run(o options) error {
 	// The shim's usys.h must win over arch/<arch>/usys.h.
 	incs = append([]string{shim}, incs...)
 
-	var objs []string
-	addObj := func(p string) { objs = append(objs, p) }
+	var objs []*obj.Object
+	build := func(src string, inline int) error {
+		text, err := compileOne(src, t, incs, defs, o, inline)
+		if err != nil {
+			return err
+		}
+		if o.keep {
+			_ = writeFile(filepath.Join(tmp, replaceExt(filepath.Base(src), ".s")), []byte(text))
+		}
+		if o.verbose {
+			fmt.Printf("  as  %s (%d bytes)\n", src, len(text))
+		}
+		ob, err := as.Assemble([]byte(text), as.Opt{Arch: arch, File: src})
+		if err != nil {
+			return err
+		}
+		objs = append(objs, ob)
+		return nil
+	}
 
 	// Runtime C: libc and the syscall wrappers.
 	for _, src := range []string{
 		filepath.Join(tos, "user", "lib.c"),
 		filepath.Join(tos, "user", "syscall.c"),
 	} {
-		obj := filepath.Join(tmp, replaceExt(filepath.Base(src), ".o"))
-		if err := buildObject(src, obj, t, incs, defs, o, shim, 0); err != nil {
+		if err := build(src, 0); err != nil {
 			return err
 		}
-		addObj(obj)
 	}
 	// The program's own translation units.  Only C `static` functions reach
 	// the inliner (they are `internal` in the IR), so this is safe even when
@@ -305,41 +297,33 @@ func run(o options) error {
 	// static function from another translation unit.
 	programInline := inlineLimit(t)
 	for _, src := range inputs {
-		obj := filepath.Join(tmp, replaceExt(filepath.Base(src), ".o"))
-		// Two inputs with the same base name would collide; make it unique.
-		if _, err := os.Stat(obj); err == nil {
-			obj = filepath.Join(tmp, fmt.Sprintf("%d_%s", len(objs), replaceExt(filepath.Base(src), ".o")))
-		}
-		if err := buildObject(src, obj, t, incs, defs, o, shim, programInline); err != nil {
+		if err := build(src, programInline); err != nil {
 			return err
 		}
-		addObj(obj)
 	}
 	// crt0, the goc syscall entry, and (ARM only) the EABI helpers.
-	crt0 := filepath.Join(tos, "user", "crt0_"+t.Arch+".S")
-	crt0Obj := filepath.Join(tmp, "crt0.o")
-	if err := assemble(crt0, crt0Obj, t, o); err != nil {
+	if err := buildAsm(filepath.Join(tos, "user", "crt0_"+t.Arch+".S"), "", arch, o, &objs); err != nil {
 		return err
 	}
-	objs = append([]string{crt0Obj}, objs...)
-
-	sysObj := filepath.Join(tmp, "gocsys.o")
-	if err := assemble(filepath.Join(shim, "syscall_"+t.Arch+".S"), sysObj, t, o); err != nil {
+	if err := buildAsm(filepath.Join(shim, "syscall_"+t.Arch+".S"), "", arch, o, &objs); err != nil {
 		return err
 	}
-	addObj(sysObj)
-
 	if t.Arch == "arm" {
-		aeabi := filepath.Join(tos, "user", "aeabi.c")
-		aeabiObj := filepath.Join(tmp, "aeabi.o")
-		if err := compileHost(aeabi, aeabiObj, t, incs, o); err != nil {
+		if err := build(filepath.Join(tos, "user", "aeabi.c"), 0); err != nil {
 			return err
 		}
-		addObj(aeabiObj)
 	}
 
+	machine := uint16(ld.EM_RISCV)
+	if t.Arch == "arm" {
+		machine = ld.EM_ARM
+	}
+	image, err := ld.Link(objs, ld.Options{Machine: machine, Thumb: t.Arch == "arm", Entry: "_start"})
+	if err != nil {
+		return err
+	}
 	elf := filepath.Join(tmp, "prog.elf")
-	if err := link(objs, elf, t, tos, o); err != nil {
+	if err := os.WriteFile(elf, image, 0o644); err != nil {
 		return err
 	}
 	out := outputPath(o.out, inputs[0], ".tos")
@@ -349,6 +333,28 @@ func run(o options) error {
 	}
 	fmt.Printf("%s: %d -> %d bytes (LZ4TOS, hint %d/%d/%d)\n",
 		out, res.RawSize, res.CompSize, res.Hint.Span, res.Hint.StackAsk, res.Hint.HeapAsk)
+	return nil
+}
+
+func buildAsm(path, text string, arch as.Arch, o options, objs *[]*obj.Object) error {
+	var src []byte
+	if text != "" {
+		src = []byte(text)
+	} else {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		src = b
+	}
+	if o.verbose {
+		fmt.Printf("  as  %s\n", path)
+	}
+	ob, err := as.Assemble(src, as.Opt{Arch: arch, File: path})
+	if err != nil {
+		return err
+	}
+	*objs = append(*objs, ob)
 	return nil
 }
 
@@ -384,10 +390,14 @@ func runtimeDefines(t target, user []string) []string {
 	return append(d, user...)
 }
 
-func compileOne(src, out string, t target, incs, defs []string, o options, inlineLimit int) error {
+// compileOne runs the C front end and the native32 back end and returns the
+// assembly text. File-scope __asm__ blocks (user/aeabi.c's divmod helpers) are
+// lifted out of the token stream and appended verbatim: they are already
+// assembly and the assembler will consume them in the same object.
+func compileOne(src string, t target, incs, defs []string, o options, inlineLimit int) (string, error) {
 	raw, err := os.ReadFile(src)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// GCC basic/extended asm is not parsed by the front end. The TinyOS
 	// userland uses exactly two shapes: an empty compiler barrier and the
@@ -397,18 +407,18 @@ func compileOne(src, out string, t target, incs, defs []string, o options, inlin
 	text := common.InjectDefines(srcText, defs)
 	toks, err := common.PreprocessTarget(text, src, false, incs...)
 	if err != nil {
-		return fmt.Errorf("%s: preprocess: %w", src, err)
+		return "", fmt.Errorf("%s: preprocess: %w", src, err)
 	}
-	toks, err = rewriteAsm(toks)
+	toks, fileAsm, err := rewriteAsm(toks)
 	if err != nil {
-		return fmt.Errorf("%s: %w", src, err)
+		return "", fmt.Errorf("%s: %w", src, err)
 	}
 	if o.preOnly {
-		return writeFile(out, []byte(common.SerializeTokens(toks)))
+		return common.SerializeTokens(toks), nil
 	}
 	prog, err := frontend.Parse(toks)
 	if err != nil {
-		return fmt.Errorf("%s: parse: %w", src, err)
+		return "", fmt.Errorf("%s: parse: %w", src, err)
 	}
 	if errs := frontend.CheckUnit(prog); len(errs) > 0 {
 		var real []string
@@ -419,86 +429,36 @@ func compileOne(src, out string, t target, incs, defs []string, o options, inlin
 			real = append(real, e.Error())
 		}
 		if len(real) > 0 {
-			return fmt.Errorf("%s: type errors:\n  %s", src, strings.Join(real, "\n  "))
+			return "", fmt.Errorf("%s: type errors:\n  %s", src, strings.Join(real, "\n  "))
 		}
 	}
 	ir, err := gocl.TranslateIR(prog, t.IRArch)
 	if err != nil {
-		return fmt.Errorf("%s: %w", src, err)
+		return "", fmt.Errorf("%s: %w", src, err)
 	}
 	if o.irOnly {
-		return writeFile(out, []byte(ir))
+		return ir, nil
 	}
 	m, err := native32.ParseModule(ir)
 	if err != nil {
-		return fmt.Errorf("%s: IR parse: %w", src, err)
+		return "", fmt.Errorf("%s: IR parse: %w", src, err)
 	}
 	if inlineLimit > 0 {
 		native32.InlineSmall(m, inlineLimit)
 	}
-	var asm string
+	var asmText string
 	if t.Arch == "rv32" {
-		asm, err = native32.EmitRV32(m)
+		asmText, err = native32.EmitRV32(m)
 	} else {
-		asm, err = native32.EmitARM(m, t.CPU)
+		asmText, err = native32.EmitARM(m, t.CPU)
 	}
 	if err != nil {
-		return fmt.Errorf("%s: %w", src, err)
+		return "", fmt.Errorf("%s: %w", src, err)
 	}
-	return writeFile(out, []byte(asm))
-}
-
-func buildObject(src, obj string, t target, incs, defs []string, o options, shim string, inlineLimit int) error {
-	asm := obj[:len(obj)-2] + ".s"
-	if err := compileOne(src, asm, t, incs, defs, o, inlineLimit); err != nil {
-		return err
+	if len(fileAsm) > 0 {
+		asmText += "\n" + strings.Join(fileAsm, "\n") + "\n"
 	}
-	return assemble(asm, obj, t, o)
-}
-
-func assemble(src, obj string, t target, o options) error {
-	args := []string{"--target=" + t.Triple}
-	args = append(args, t.ArchFlags...)
-	args = append(args, "-c", src, "-o", obj)
-	return runCmd(o.cc, args, o.verbose)
-}
-
-func compileHost(src, obj string, t target, incs []string, o options) error {
-	args := []string{"--target=" + t.Triple}
-	args = append(args, t.ArchFlags...)
-	for _, d := range incs {
-		args = append(args, "-I", d)
-	}
-	args = append(args, "-c", src, "-o", obj)
-	return runCmd(o.cc, args, o.verbose)
-}
-
-func link(objs []string, out string, t target, tos string, o options) error {
-	args := []string{"-m", t.Emulation,
-		"-T", filepath.Join(tos, "user", "user.ld"),
-		"-nostdlib", "-pie", "--gc-sections",
-		"-z", "max-page-size=16", "-z", "now", "-s",
-		"-o", out,
-	}
-	if t.TextReloc {
-		args = append(args, "-z", "notext")
-	}
-	args = append(args, objs...)
-	return runCmd(o.ld, args, o.verbose)
-}
-
-func runCmd(name string, args []string, verbose bool) error {
-	if verbose {
-		fmt.Printf("+ %s %s\n", name, strings.Join(args, " "))
-	}
-	cmd := exec.Command(name, args...)
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %v\n%s", name, err, strings.TrimSpace(out.String()))
-	}
-	return nil
+	return asmText, nil
 }
 
 func extractShim(dir string) (string, error) {
@@ -640,12 +600,27 @@ func writeFile(p string, b []byte) error {
 }
 
 // rewriteAsm replaces GCC __asm__/asm constructs with a call to the runtime
-// trap helper, or removes an empty barrier. It works on the preprocessed token
+// trap helper, or removes an empty barrier. A file-scope __asm__ block is
+// returned separately and assembled as-is. It works on the preprocessed token
 // stream so macros such as TOS_ILLEGAL_INSN() are already expanded.
-func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
+func rewriteAsm(toks []frontend.Token) ([]frontend.Token, []string, error) {
 	var out []frontend.Token
+	var fileAsm []string
+	depth := 0
 	for i := 0; i < len(toks); i++ {
 		tk := toks[i]
+		if tk.Text == "{" {
+			depth++
+			out = append(out, tk)
+			continue
+		}
+		if tk.Text == "}" {
+			if depth > 0 {
+				depth--
+			}
+			out = append(out, tk)
+			continue
+		}
 		if !isAsmToken(tk) {
 			out = append(out, tk)
 			continue
@@ -661,32 +636,41 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
 			continue
 		}
 		open := j
-		depth := 0
+		d := 0
 		close := -1
-		var asmText []byte
-		seenStr := false
+		var body strings.Builder
 		for k := open; k < len(toks); k++ {
 			switch toks[k].Text {
 			case "(":
-				depth++
+				d++
 			case ")":
-				depth--
-				if depth == 0 {
+				d--
+				if d == 0 {
 					close = k
 				}
 			}
-			if depth == 1 && !seenStr && toks[k].Kind == frontend.TStr {
-				asmText = toks[k].Str
-				seenStr = true
+			if d == 1 && toks[k].Kind == frontend.TStr {
+				body.Write(toks[k].Str)
 			}
 			if close >= 0 {
 				break
 			}
 		}
 		if close < 0 {
-			return nil, fmt.Errorf("unterminated inline asm")
+			return nil, nil, fmt.Errorf("unterminated inline asm")
 		}
-		// register int r0 __asm__("r0") = ... �?a register-binding
+		if depth == 0 {
+			// A file-scope asm block is a piece of an assembly file written
+			// inside a C file.  Hand it to the assembler instead of trying to
+			// parse it as C.
+			fileAsm = append(fileAsm, body.String())
+			i = close
+			if i+1 < len(toks) && toks[i+1].Text == ";" {
+				i++
+			}
+			continue
+		}
+		// register int r0 __asm__("r0") = ... — a register-binding
 		// declarator, not an asm statement. The back end treats register as a
 		// no-op, so drop the binding and let normal allocation happen.
 		if !volatileSeen && len(out) > 0 && out[len(out)-1].Kind == frontend.TIdent {
@@ -700,15 +684,15 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
 				continue
 			}
 		}
-		body := strings.TrimSpace(string(asmText))
-		if body == "" {
+		asmBody := strings.TrimSpace(body.String())
+		if asmBody == "" {
 			// An empty asm is a compiler barrier; the stack-machine back ends
 			// do not optimise, so dropping it is equivalent.
 			i = close
 			continue
 		}
-		if !isTrapAsm(body) {
-			return nil, fmt.Errorf("unsupported inline asm %q", body)
+		if !isTrapAsm(asmBody) {
+			return nil, nil, fmt.Errorf("unsupported inline asm %q", asmBody)
 		}
 		line := tk.Line
 		out = append(out,
@@ -718,7 +702,7 @@ func rewriteAsm(toks []frontend.Token) ([]frontend.Token, error) {
 		)
 		i = close
 	}
-	return out, nil
+	return out, fileAsm, nil
 }
 
 func isAsmToken(t frontend.Token) bool {

@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -223,6 +224,9 @@ func WindowHint(raw []byte) (Hint, error) {
 func Pack(elfPath, outPath string) (Result, error) {
 	raw, err := os.ReadFile(elfPath)
 	if err != nil {
+		return Result{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return Result{}, err
 	}
 	hint, err := WindowHint(raw)

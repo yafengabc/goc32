@@ -17,11 +17,13 @@ Pipeline:
 
 ```
 C -> goc front end -> pure-Go IR text -> native32 -> RV32IM / Thumb asm
-  -> clang (assemble) -> ld.lld (link) -> LZ4TOS envelope
+  -> goc32/as (assemble) -> goc32/ld (link) -> LZ4TOS envelope
 ```
 
-No cgo and no `libLLVM.dll`. clang/ld.lld are used only as the assembler and
-linker in this milestone; an internal assembler/linker is next.
+No cgo, no `libLLVM.dll`, and **no external toolchain**: the assembler
+(`internal/as`) and the linker (`internal/ld`) are part of the compiler. The
+only things needed to build a user program are the command and the TinyOS
+checkout (for `user.ld`, the libc sources and the headers).
 
 ## Build
 
@@ -46,18 +48,19 @@ goc32 -target arm     -o build/hello.tos user/hello.c
 
 Targets:
 
-| `-target` | ISA | clang triple / CPU | link emulation |
+| `-target` | ISA | core | assembler |
 |---|---|---|---|
-| `rv32` (default), `esp32c3` | RV32IMC | `riscv32-unknown-elf`, `-march=rv32imc -mabi=ilp32` | `elf32lriscv` |
-| `rv32nc` | RV32IM | same, `-march=rv32im` | `elf32lriscv` |
-| `arm` | Thumb / ARMv7-M | `thumbv7m`, Cortex-M3 | `armelf` |
-| `rp2040` | Thumb-1 / ARMv6-M | `thumbv6m`, Cortex-M0+ | `armelf` |
-| `rp2350` | Thumb / ARMv8-M | `thumbv8m.main`, Cortex-M33 | `armelf` |
+| `rv32` (default), `esp32c3` | RV32IMC | any RV32 | `RV32` |
+| `rv32nc` | RV32IM | rv32im (no compressed) | `RV32` |
+| `arm` | Thumb / ARMv7-M | Cortex-M3 | `Thumb2` |
+| `rp2040` | Thumb-1 / ARMv6-M | Cortex-M0+ | `Thumb1` |
+| `rp2350` | Thumb / ARMv8-M | Cortex-M33 | `Thumb2` |
 
 Diagnostics: `-S` (assembly), `-ir` (gocl IR), `-E` (preprocessed C), `-keep`,
 `-v`, `-pack` (wrap an already linked ELF in LZ4TOS without compiling), `-ll`
 (treat the input as LLVM IR text and emit assembly). Extra includes/defines:
-`-I`, `-D`.
+`-I`, `-D`. `GOC32_MAP=1` prints every live section and its address while
+linking.
 
 The compiler finds the TinyOS checkout by walking up from the input source (it
 looks for `user/lib.c`, `user/user.ld`, `include/tos.h`). Use `-tos DIR` or
@@ -83,11 +86,38 @@ kernel can size the task window before decompressing. `mklfs` copies a file
 that is not an ELF verbatim, so dropping the `.tos` into `build/fs-stage/bin/`
 and rebuilding the ramdisk installs it without recompression.
 
-Tested end to end:
+Tested end to end against QEMU:
 
-- RV32 / ESP32-C3, `hello`, `hello_printf`, `reloc`, `wheap`, `ls` and `sh`
-  in `rv32emu-c`;
-- ARM / QEMU mps2 Cortex-M3, the same set in `qemu-system-arm`.
+- RV32 (`qemu-system-riscv32`): `hello`, `ls`, `cat`, `wc`, `echo`, `free`,
+  `mem` (heap growth), `df`, `uptime`, `piperace` (pipes/threads), `prot`
+  (intentional faults) and `msh` driving builtins;
+- ARM (`qemu-system-arm`, Cortex-M3): the same set, plus a second `msh` as a
+  child process (`gmsh` ? `ls`, `free`, `ps`);
+- `TOS_STACK`/`TOS_HEAP` notes survive the link (8 KiB/6 KiB test program).
+
+97 of the 132 `user/*.c` builds (each file for RV32 and ARM) go through the
+whole pipeline. The rest stop in the C front end, not in the assembler or
+linker: floating point, GCC extended asm, a few C99 declarations (`const`
+after the type) and `mutex_t`.
+
+## Known compiler limitations
+
+The assembler and linker are complete for the instruction subset native32
+emits, and every non-branch instruction in the generated RV32/Thumb assembly
+has been diffed byte-for-byte against clang's assembler. What is still missing
+is in the compiler front end or code generator:
+
+- **ARM `*s++ = c`**: native32 can lose the old pointer across the post-
+  increment (`msh`'s `split()` does this). `gmsh` then faults on `echo hi`
+  even when the same assembly is assembled and linked by clang, so this is a
+  codegen bug rather than a toolchain one.
+- **goc32 code is larger than clang's**: no compressed RISC-V instructions and
+  no branch relaxation into `c.j`/`c.b`, plus inline literal words on ARM. A
+  goc32-built `msh` needs a 20 KiB window on RV32 (the clang-built image still
+  fits in 16 KiB), which is why releases keep using clang.
+- **front-end gaps**: `const` in some declaration positions, float IR, most
+  GCC extended asm, and a handful of typedefs are rejected before code
+  generation.
 
 All 37 programs under `user/` compile and link for RV32. 36/37 do so for ARM;
 `smp.c` is the exception because it binds GCC register variables to `r0`/`r1`/
@@ -264,7 +294,7 @@ tail, as its documentation says it should).
 ## Layout
 
 ```
-main.go                 one-click driver: compile, link, pack
+main.go                 one-click driver: compile, assemble, link, pack
 internal/frontend/      C lexer/parser/checker (from goc)
 internal/common/        preprocessor and shared program types (from goc)
 internal/ir/            gocl's pure-Go IR translator, with the LLVM DLL
@@ -272,7 +302,11 @@ internal/ir/            gocl's pure-Go IR translator, with the LLVM DLL
 internal/goa/           two-function stub for the assembler queries the IR
                         translator makes (TinyOS never takes that path)
 internal/native32/      IR parser + RV32IM and Thumb emitters
+internal/as/            two-pass RV32/Thumb assembler
+internal/ld/            PIE linker: --gc-sections, user.ld layout, .rela.dyn
+internal/obj/           in-memory object: sections, symbols, relocations
 internal/lz4tos/        LZ4 block compressor, ELF window hint, envelope
+cmd/asprobe/            dev-only: dump one file's assembled bytes
 tinyos/goc/             usys.h shim + __tos_syscall for ecall/svc
 ```
 
@@ -287,7 +321,7 @@ function-wide register allocator, so correctness and size still come before
 speed.
 
 `rp2040` emits the ARMv6-M subset; `arm` (Cortex-M3) and `rp2350` (Cortex-M33)
-use the wider Thumb-2 offset forms, so binaries are built per board. ARM links
-currently need `-z notext` because Thumb-1's out-of-range branches and symbol
-literals are absolute words in `.text`; TinyOS's loader already applies
-`R_ARM_ABS32`.
+use the wider Thumb-2 offset forms, so binaries are built per board. Absolute
+words in `.text` (Thumb-1 jump targets and `ldr rX, =expr` literals) are emitted
+as `R_ARM_RELATIVE` entries in `.rela.dyn`, and TinyOS's loader applies them
+together with the load bias, so no `-z notext` is involved.

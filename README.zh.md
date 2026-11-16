@@ -16,11 +16,12 @@ goc32 user/hello.c
 
 ```
 C -> goc 前端 -> 纯 Go 的 IR 文本 -> native32 -> RV32IM / Thumb 汇编
-  -> clang（汇编）-> ld.lld（链接）-> LZ4TOS 信封
+  -> goc32/as（汇编）-> goc32/ld（链接）-> LZ4TOS 信封
 ```
 
-没有 cgo，也没有 `libLLVM.dll`。这一阶段 clang/ld.lld 只当汇编器和链接器用；
-内置汇编器/链接器是下一步。
+没有 cgo、没有 `libLLVM.dll`，**也不需要外部工具链**：汇编器
+（`internal/as`）和链接器（`internal/ld`）就在编译器里。编译一个用户程序
+只需要本命令和 TinyOS 检出目录（拿 `user.ld`、libc 源码和头文件）。
 
 ## 构建
 
@@ -45,17 +46,18 @@ goc32 -target arm     -o build/hello.tos user/hello.c
 
 目标：
 
-| `-target` | ISA | clang triple / CPU | 链接 emulation |
+| `-target` | ISA | 内核 | 汇编器 |
 |---|---|---|---|
-| `rv32`（默认）、`esp32c3` | RV32IMC | `riscv32-unknown-elf`、`-march=rv32imc -mabi=ilp32` | `elf32lriscv` |
-| `rv32nc` | RV32IM | 同上，`-march=rv32im` | `elf32lriscv` |
-| `arm` | Thumb / ARMv7-M | `thumbv7m`、Cortex-M3 | `armelf` |
-| `rp2040` | Thumb-1 / ARMv6-M | `thumbv6m`、Cortex-M0+ | `armelf` |
-| `rp2350` | Thumb / ARMv8-M | `thumbv8m.main`、Cortex-M33 | `armelf` |
+| `rv32`（默认）、`esp32c3` | RV32IMC | 任意 RV32 | `RV32` |
+| `rv32nc` | RV32IM | rv32im（无压缩指令） | `RV32` |
+| `arm` | Thumb / ARMv7-M | Cortex-M3 | `Thumb2` |
+| `rp2040` | Thumb-1 / ARMv6-M | Cortex-M0+ | `Thumb1` |
+| `rp2350` | Thumb / ARMv8-M | Cortex-M33 | `Thumb2` |
 
 诊断选项：`-S`（汇编）、`-ir`（gocl IR）、`-E`（预处理后的 C）、`-keep`、
-`-v`、`-pack`（不编译，只把已链接的 ELF 包进 LZ4TOS）、`-ll`（把输入当作 LLVM
-IR 文本并输出汇编）。额外 include/宏：`-I`、`-D`。
+`-v`、`-pack`（不编译，只把已链接的 ELF 包进 LZ4TOS）、`-ll`（把输入当作
+LLVM IR 文本并输出汇编）。额外 include/宏：`-I`、`-D`。链接时设
+`GOC32_MAP=1` 会打印每个存活段的名字和地址。
 
 编译器从输入源文件向上查找 TinyOS 检出目录（找 `user/lib.c`、`user/user.ld`、
 `include/tos.h`）。源码不在检出目录里时用 `-tos DIR` 或 `TOS_ROOT`。
@@ -79,14 +81,33 @@ span/stack/heap 的算法与 `tools/mklfs.c` 完全一致，所以内核能在�
 按这三个量分配任务窗口。`mklfs` 对非 ELF 文件是原样拷贝，因此把 `.tos` 放进
 `build/fs-stage/bin/` 再重建 ramdisk 就能安装，不需要二次压缩。
 
-端到端验证过的组合：
+端到端验证过的组合（QEMU）：
 
-- RV32 / ESP32-C3：`hello`、`hello_printf`、`reloc`、`wheap`、`ls`、`sh`，
-  在 `rv32emu-c` 里跑；
-- ARM / QEMU mps2 Cortex-M3：同一组程序，在 `qemu-system-arm` 里跑。
+- RV32（`qemu-system-riscv32`）：`hello`、`ls`、`cat`、`wc`、`echo`、`free`、
+  `mem`（堆增长）、`df`、`uptime`、`piperace`（管道/线程）、`prot`（故意触
+  发的保护错误），以及 `msh` 驱动内建命令；
+- ARM（`qemu-system-arm`，Cortex-M3）：同一组程序，外加把 `msh` 作为子进程
+  再启动一次（`gmsh` → `ls`、`free`、`ps`）；
+- `TOS_STACK`/`TOS_HEAP` 的 note 能穿过链接（8 KiB/6 KiB 的测试程序）。
 
-`user/` 下的 37 个程序在 RV32 上全部能编译链接；ARM 上是 36/37，例外是
-`smp.c`——它把 GCC 寄存器变量绑到 `r0`/`r1`/`r2` 并直接发 `svc #0`。
+132 次 `user/*.c` 构建（每个源文件各编 RV32 和 ARM）里有 97 次走完整条流水
+线。其余卡在 C 前端，而不是汇编器或链接器：浮点、GCC 扩展 asm、少数 C99 声
+明位置（类型后的 `const`）以及 `mutex_t`。
+
+## 已知的编译器限制
+
+汇编器和链接器对 native32 发射的指令子集是完整的：RV32/Thumb 生成的汇编
+里，**每一条非跳转指令**都和 clang 汇编器逐字节比对过。还缺的是前端或代码
+生成：
+
+- **ARM 的 `*s++ = c`**：native32 会在后自增时丢掉旧指针（`msh` 的
+  `split()` 就是这种写法）。`gmsh` 因此在 `echo hi` 上出错；同一份汇编交给
+  clang 汇编/链接也一样，所以这是代码生成的 bug，不是工具链的。
+- **goc32 的目标码比 clang 大**：不发压缩的 RISC-V 指令，也不把分支放松成
+  `c.j`/`c.b`，ARM 上还有内联文字池。goc32 编出的 `msh` 在 RV32 上需要
+  20 KiB 窗口（clang 编的发布镜像仍是 16 KiB），所以发布镜像继续用 clang。
+- **前端缺口**：部分声明位置的 `const`、浮点 IR、多数 GCC 扩展 asm，以及少
+  数 typedef，在代码生成之前就会被拒绝。
 
 ## 代码体积
 
@@ -211,14 +232,18 @@ ALU 指令只能编码低寄存器），参数直接从 `r0-r3` 写入。ARMv7-M
 ## 目录
 
 ```
-main.go                 一键驱动：编译、链接、打包
+main.go                 一键驱动：编译、汇编、链接、打包
 internal/frontend/      C 词法/语法/检查器（来自 goc）
 internal/common/        预处理器与共享程序类型（来自 goc）
-internal/ir/            gocl 的纯 Go IR 转换器，去掉了 LLVM DLL 加载器和目标文件发射
-internal/goa/           汇编器查询的两函数占位实现（stub）（TinyOS 不会走那条路径）
+internal/ir/            gocl 的纯 Go IR 转换器（去掉了 LLVM DLL 加载和目标文件发射）
+internal/goa/           汇编器查询的两个占位实现（stub）；TinyOS 不经过那条路径
 internal/native32/      IR 解析器 + RV32IM 与 Thumb 发射器
-internal/lz4tos/        LZ4 块压缩、ELF 窗口提示、信封
-tinyos/goc/             usys.h 兼容层 + ecall/svc 用的 __tos_syscall
+internal/as/            两遍 RV32/Thumb 汇编器
+internal/ld/            PIE 链接器：--gc-sections、user.ld 布局、.rela.dyn
+internal/obj/           内存对象：段、符号、重定位
+internal/lz4tos/        LZ4 压解压、ELF 窗口提示、信封
+cmd/asprobe/            开发用：把一个文件的汇编结果打成十六进制
+tinyos/goc/             usys.h 垫片 + ecall/svc 用的 __tos_syscall
 ```
 
 ## 当前覆盖与限制
