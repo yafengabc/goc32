@@ -1,0 +1,66 @@
+# TinyOS syscall table snapshot - goc32's input, not a build product.
+#
+# goc32 builds without a TinyOS checkout, so this copy is committed there;
+# abi/syscalls.csv in the TinyOS tree stays the single source of truth.
+# When both trees are present, internal/build/syscallsnapshot_test.go compares
+# the two and fails if they differ.
+#
+#   tinyos_commit: 029dc285edc390e750f885ad1d871f2614f21a1d
+#   tinyos_csv_sha256: 445e23aff15f2944b76762fc1b6091675fdb48c61c3bde1d3f33d0b7aa75a16f
+#
+# Regenerate after changing abi/syscalls.csv:
+#   python scripts/syscalls-snapshot.py
+name,value
+SYS_EXIT,0
+SYS_WRITE,1
+SYS_READ,2
+SYS_EXEC,3
+SYS_OPEN,4
+SYS_CLOSE,5
+SYS_READDIR,6
+SYS_GETPID,7
+SYS_SLEEP,8
+SYS_UPTIME,9
+SYS_SBRK,10
+SYS_CREATE,11
+SYS_WAIT,12
+SYS_YIELD,13
+SYS_PS,14
+SYS_SIGNAL,15
+SYS_REBOOT,16
+SYS_SETPRIO,17
+SYS_STAT,18
+SYS_MEMINFO,19
+SYS_DF,20
+SYS_CHDIR,21
+SYS_GETCWD,22
+SYS_TTYRAW,23
+SYS_CLOCK,24
+SYS_GETCPU,25
+SYS_GPIO,26
+SYS_ADC,27
+SYS_PIPE,28
+SYS_DUP2,29
+SYS_IOCTL,30
+SYS_UNLINK,31
+SYS_HIST,32
+SYS_LSEEK,33
+SYS_FSTAT,34
+SYS_DUP,35
+SYS_READDIR_AT,36
+SYS_POLL,37
+SYS_MSG_SEND,38
+SYS_MSG_RECV,39
+SYS_PWM,40
+SYS_UART_WRITE,41
+SYS_UART_READ,42
+SYS_UART_COUNT,43
+SYS_SPI,44
+SYS_I2C,45
+SYS_DMA_MEMCPY,47
+SYS_THREAD_CREATE,48
+SYS_THREAD_EXIT,49
+SYS_THREAD_JOIN,50
+SYS_SCHEDSTAT,51
+SYS_PIO,52
+SYS_REMOTE_TEST,53
